@@ -2106,7 +2106,7 @@ def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: l
         e = load_envelope(conn, sym, period, pct)
         if e:
             env_map[sym] = e
-            
+    
     symbol_names: dict[str, str] = {}
     dft = cfg.get("default") if isinstance(cfg.get("default"), dict) else {}
     dft_tickers = dft.get("tickers") if isinstance(dft.get("tickers"), list) else []
@@ -2201,4 +2201,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
