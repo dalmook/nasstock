@@ -1,5 +1,6 @@
 ﻿import argparse
 import datetime as dt
+import io
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from pypdf import PdfReader
+
 
 LOG = logging.getLogger("nas_alert_runner")
 KST = ZoneInfo("Asia/Seoul")
@@ -23,6 +26,75 @@ DEFAULT_OVERSIZE_DROP_PCT = -0.05
 DEFAULT_OVERSIZE_BUY_SHARES = 1
 GLOBAL_BRIEF_CHAT_ID = "__MARKET_BRIEF__"
 MARKET_BRIEF_TEMPLATE_VERSION = "v2"
+
+NEWS_BUCKET_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "macro": (
+        "연준",
+        "fomc",
+        "cpi",
+        "pce",
+        "고용",
+        "실업",
+        "금리",
+        "기준금리",
+        "국채",
+        "재정",
+        "관세",
+        "fed",
+        "ecb",
+        "boj",
+    ),
+    "us": (
+        "나스닥",
+        "s&p",
+        "다우",
+        "뉴욕증시",
+        "미국증시",
+        "테슬라",
+        "엔비디아",
+        "애플",
+        "마이크로소프트",
+        "아마존",
+        "메타",
+        "알파벳",
+        "nasdaq",
+        "wall street",
+        "earnings",
+        "us stock",
+    ),
+    "kr": (
+        "코스피",
+        "코스닥",
+        "국내증시",
+        "한국증시",
+        "상한가",
+        "하한가",
+        "삼성전자",
+        "sk하이닉스",
+        "외국인",
+        "기관",
+        "개인",
+        "공매도",
+        "krx",
+    ),
+    "fx": (
+        "환율",
+        "원달러",
+        "달러",
+        "달러인덱스",
+        "dxy",
+        "유가",
+        "wti",
+        "브렌트",
+        "금값",
+        "구리",
+        "천연가스",
+        "중동",
+        "전쟁",
+        "지정학",
+        "원자재",
+    ),
+}
 
 MORNING_CARD_ITEMS = [
     {"symbol": "^KS11", "name": "코스피", "digits": 2},
@@ -467,7 +539,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
 
     system_prompt = (
         "한국어 금융 브리프 편집자. 기사 본문 금지. 입력 헤드라인/설명/지표만 사용. "
-        "중복 제거·압축하고 JSON만 출력."
+        "중복 제거·압축하고 JSON만 출력. 카테고리 혼입 금지."
     )
     schema_hint = {
         "tldr": ["문장", "문장", "문장"],
@@ -492,6 +564,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
             "JSON object only",
             "no markdown",
             "bucket당 2~4개 포인트",
+            "카테고리 혼입 금지(미국/한국/거시/환율·원자재 엄격 분리)",
             "링크는 대표 1~3개",
             "점수는 0~10 정수",
             "불확실하면 보수적 표현",
@@ -539,6 +612,23 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
     return None
 
 
+def _bucket_score(text: str, bucket: str) -> int:
+    keywords = NEWS_BUCKET_KEYWORDS.get(bucket, ())
+    if not keywords:
+        return 0
+    low = text.lower()
+    return sum(1 for kw in keywords if kw in low)
+
+
+def _guess_news_bucket(title: str, summary: str) -> str | None:
+    text = f"{title} {summary}".strip()
+    if not text:
+        return None
+    scores = {b: _bucket_score(text, b) for b in NEWS_BUCKET_KEYWORDS.keys()}
+    best_bucket = max(scores, key=lambda b: scores[b])
+    return best_bucket if scores[best_bucket] > 0 else None
+
+
 def _news_bucket_queries() -> dict[str, list[str]]:
     return {
         "macro": ["연준 금리 CPI 고용 미국채", "FOMC inflation bond yield"],
@@ -554,8 +644,9 @@ def collect_market_brief_headlines(
     buckets: dict[str, list[dict[str, str]]] = {k: [] for k in _news_bucket_queries().keys()}
     if not naver_client_id or not naver_client_secret:
         return buckets
+
+    per_bucket_links: dict[str, set[str]] = {k: set() for k in buckets.keys()}
     for bucket, queries in _news_bucket_queries().items():
-        seen: set[str] = set()
         for q in queries:
             try:
                 rows = fetch_naver_news(naver_client_id, naver_client_secret, q, display=20)
@@ -564,13 +655,19 @@ def collect_market_brief_headlines(
                 continue
             for r in rows:
                 link = str(r.get("link", "")).strip()
-                if not link or link in seen:
+                title = str(r.get("title", "")).strip()
+                summary = _clean_news_text(r.get("summary", ""), limit=100)
+                if not link or not title:
                     continue
-                seen.add(link)
+                if _guess_news_bucket(title, summary) != bucket:
+                    continue
+                if link in per_bucket_links[bucket]:
+                    continue
+                per_bucket_links[bucket].add(link)
                 buckets[bucket].append(
                     {
-                        "title": str(r.get("title", "")),
-                        "description": _clean_news_text(r.get("summary", ""), limit=100),
+                        "title": title,
+                        "description": summary,
                         "link": link,
                         "pubDate": str(r.get("pub", "")),
                     }
@@ -881,6 +978,69 @@ def get_or_create_market_brief_report(
     indicators_payload = build_market_brief_indicators_payload(market_rows)
     brief_json = openai_market_brief_json(headlines, indicators_payload) or fallback_market_brief_json(headlines, indicators_payload)
     html = render_market_brief_html(today, now_time, brief_json, market_rows)
+    save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, html)
+    return token
+
+
+def build_economy_brief_token(date_kst: str) -> str:
+    return f"economy-brief-{date_kst}"
+
+
+def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any], reports: list[dict[str, str]]) -> str:
+    overview = escape(str(digest.get("overview", "")).strip()) if isinstance(digest, dict) else ""
+    items = digest.get("items") if isinstance(digest, dict) and isinstance(digest.get("items"), list) else []
+    lis = []
+    for i, it in enumerate(items[:10], start=1):
+        if not isinstance(it, dict):
+            continue
+        title = escape(str(it.get("title") or "(제목 없음)").strip())
+        source = escape(str(it.get("source") or "").strip())
+        date = escape(str(it.get("date") or "").strip())
+        summary = escape(str(it.get("summary") or "").strip())
+        link = str(it.get("pdf_link") or it.get("detail_link") or "").strip()
+        meta = " · ".join([x for x in [source, date] if x])
+        h = f"<li><b>{i}. {title}</b>"
+        if meta:
+            h += f" <span style='color:#6b7280;'>({meta})</span>"
+        if summary:
+            h += f"<div style='margin-top:4px;'>{summary}</div>"
+        if link:
+            h += f"<div style='margin-top:4px;'><a href='{escape(link)}' target='_blank' rel='noopener noreferrer'>원문 링크</a></div>"
+        h += "</li>"
+        lis.append(h)
+    if not lis:
+        for i, r in enumerate(reports[:10], start=1):
+            title = escape(str(r.get("title", "")))
+            source = escape(str(r.get("source", "")))
+            date = escape(str(r.get("date", "")))
+            link = str(r.get("pdf_link") or r.get("detail_link") or "").strip()
+            lis.append(f"<li><b>{i}. {title}</b> <span style='color:#6b7280;'>({source} · {date})</span>" + (f"<div><a href='{escape(link)}' target='_blank' rel='noopener noreferrer'>원문 링크</a></div>" if link else "") + "</li>")
+    if not lis:
+        lis.append("<li>금일 등록된 경제분석 리포트가 아직 없습니다.</li>")
+
+    return f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/><title>경제분석 리포트 브리프</title></head>
+<body style='margin:0;padding:20px;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Noto Sans KR,sans-serif;color:#111827;'>
+<div style='max-width:780px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:18px;'>
+<div style='font-size:13px;color:#6b7280;'>📘 Economy Report Brief</div>
+<div style='font-size:26px;font-weight:900;margin-top:6px;'>{escape(today)} {escape(now_time)} KST</div>
+<div style='font-size:13px;color:#6b7280;margin-top:4px;'>생성시각: 15시 이후 1회 · 발송시각: 16시 이후 1회</div>
+<div style='margin-top:14px;padding:12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;line-height:1.7;'>{overview or '요약 없음'}</div>
+<div style='margin-top:14px;font-weight:900;'>리포트 목록 (최대 10개)</div>
+<ul style='line-height:1.7;padding-left:18px;'>{''.join(lis)}</ul>
+</div></body></html>"""
+
+
+def get_or_create_economy_brief_report(conn: sqlite3.Connection, today: str, now_time: str) -> str:
+    token = build_economy_brief_token(today)
+    existing = load_chat_report_html(conn, token)
+    if existing:
+        return token
+    reports = fetch_naver_economy_reports(limit=10)
+    if not reports:
+        LOG.info("economy brief skipped: no reports for %s", today)
+        return ""
+    digest = openai_economy_report_digest(reports) if reports else {}
+    html = render_economy_brief_html(today, now_time, digest if isinstance(digest, dict) else {}, reports)
     save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, html)
     return token
 
@@ -1435,6 +1595,195 @@ def fetch_naver_news(client_id: str, client_secret: str, query: str, display: in
     return out
 
 
+def _extract_pdf_text_excerpt(pdf_bytes: bytes, max_pages: int = 8, max_chars: int = 3800) -> str:
+    if not pdf_bytes:
+        return ""
+    text_chunks: list[str] = []
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages[: max(1, max_pages)]:
+            page_text = str(page.extract_text() or "").strip()
+            if page_text:
+                text_chunks.append(page_text)
+            if sum(len(x) for x in text_chunks) >= max_chars:
+                break
+    except Exception:
+        return ""
+    text = "\n".join(text_chunks)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def _fetch_naver_report_pdf_info(detail_link: str) -> tuple[str, str]:
+    if not detail_link:
+        return "", ""
+    try:
+        req = Request(detail_link, headers={"user-agent": "Mozilla/5.0", "accept": "text/html"})
+        with urlopen(req, timeout=25) as resp:
+            html = resp.read().decode("euc-kr", errors="ignore")
+    except Exception:
+        return "", ""
+
+    m = re.search(r'href="([^"]+\.pdf(?:\?[^"]*)?)"', html, flags=re.IGNORECASE)
+    if not m:
+        return "", ""
+    pdf_link = str(m.group(1)).strip()
+    if pdf_link.startswith("/"):
+        pdf_link = "https://finance.naver.com" + pdf_link
+    if not pdf_link.startswith("http"):
+        return "", ""
+
+    try:
+        req_pdf = Request(pdf_link, headers={"user-agent": "Mozilla/5.0", "accept": "application/pdf"})
+        with urlopen(req_pdf, timeout=35) as resp:
+            pdf_bytes = resp.read()
+    except Exception:
+        return pdf_link, ""
+    return pdf_link, _extract_pdf_text_excerpt(pdf_bytes)
+
+
+def fetch_naver_economy_reports(limit: int = 10) -> list[dict[str, str]]:
+    count = max(1, min(int(limit), 10))
+    url = "https://finance.naver.com/research/economy_list.naver"
+    req = Request(
+        url,
+        headers={"user-agent": "Mozilla/5.0", "accept": "text/html,application/xhtml+xml"},
+    )
+    with urlopen(req, timeout=25) as resp:
+        html = resp.read().decode("euc-kr", errors="ignore")
+
+    # 네이버 리서치 테이블 구조: 제목 | 증권사 | 첨부 | 작성일 | 조회수
+    tr_blocks = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE | re.DOTALL)
+    out: list[dict[str, str]] = []
+    for tr in tr_blocks:
+        if "<a" not in tr or "pdf" not in tr.lower():
+            continue
+
+        title_m = re.search(r'<a[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>', tr, flags=re.IGNORECASE | re.DOTALL)
+        if not title_m:
+            continue
+        detail_link = _clean_news_text(title_m.group("href"), limit=300)
+        if detail_link.startswith("/"):
+            detail_link = "https://finance.naver.com" + detail_link
+        title = _clean_news_text(title_m.group("title"), limit=120)
+
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.IGNORECASE | re.DOTALL)
+        cols = [_clean_news_text(td, limit=120) for td in tds]
+        source = cols[1] if len(cols) >= 2 else ""
+        # 작성일이 보통 4번째 열(예: 26.02.24)
+        date = cols[3] if len(cols) >= 4 else ""
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", date or ""):
+            cand = next((c for c in cols if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", c)), "")
+            date = cand
+
+        pdf_link, pdf_excerpt = _fetch_naver_report_pdf_info(detail_link)
+        out.append(
+            {
+                "date": date,
+                "source": source,
+                "title": title,
+                "detail_link": detail_link,
+                "pdf_link": pdf_link,
+                "pdf_excerpt": _clean_news_text(pdf_excerpt, limit=3500),
+            }
+        )
+        if len(out) >= count:
+            break
+
+    return out
+
+
+def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any] | None:
+    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if not api_key or not reports:
+        return None
+    payload = {
+        "date_kst": fmt_date_kst(now_kst()),
+        "reports": reports,
+        "output_format": {
+            "overview": "오늘의 경제분석 리포트 흐름 요약 3~5문장",
+            "items": [{"title": "", "source": "", "date": "", "summary": "", "study_points": ["", "", ""], "link": ""}],
+            "study_guide": ["", "", ""],
+        },
+        "rules": [
+            "한국어",
+            "JSON object only",
+            "items는 최대 10개",
+            "각 summary는 3~4문장",
+            "study_points는 학습 포인트 2~3개",
+            "입력 목록 외 내용 추정 금지",
+            "pdf_excerpt가 비어있으면 제목/기관/날짜만 보수적으로 요약",
+        ],
+    }
+    req_body = {
+        "model": "gpt-5-mini",
+        "reasoning": {"effort": "low"},
+        "input": [
+            {"role": "system", "content": [{"type": "text", "text": "거시경제 리서치 튜터. PDF 발췌문 중심으로 학습용 요약을 만들고 JSON만 출력."}]},
+            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]},
+        ],
+        "text": {"format": {"type": "json_object"}},
+        "max_output_tokens": 2600,
+    }
+    try:
+        req = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=70) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        parsed = json.loads(_openai_extract_json_text(json.loads(raw)).strip())
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as e:
+        LOG.warning("openai economy digest failed: %s", e)
+        return None
+
+
+def build_economy_report_digest_message(today: str, now_time: str, reports: list[dict[str, str]]) -> str:
+    digest = openai_economy_report_digest(reports)
+    lines = [f"📘 네이버 경제분석 리포트 요약 ({today} {now_time})", "━━━━━━━━━━━━━━━"]
+    if isinstance(digest, dict):
+        overview = str(digest.get("overview", "")).strip()
+        if overview:
+            lines.extend(["[오늘의 흐름]", overview, "━━━━━━━━━━━━━━━"])
+        items = digest.get("items") if isinstance(digest.get("items"), list) else []
+        for idx, it in enumerate(items[:10], start=1):
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "(제목 없음)").strip()
+            source = str(it.get("source") or "").strip()
+            date = str(it.get("date") or "").strip()
+            summary = str(it.get("summary") or "").strip()
+            link = str(it.get("pdf_link") or it.get("detail_link") or "").strip()
+            pts = [str(x).strip() for x in (it.get("study_points") or []) if str(x).strip()]
+            meta = " · ".join([x for x in [source, date] if x])
+            lines.append(f"{idx}. {title}" + (f" ({meta})" if meta else ""))
+            if summary:
+                lines.append(f"요약: {summary}")
+            if pts:
+                lines.append("학습포인트: " + " / ".join(pts[:3]))
+            if link:
+                lines.append(f"링크: {link}")
+            lines.append("━━━━━━━━━━━━━━━")
+        guide = digest.get("study_guide") if isinstance(digest.get("study_guide"), list) else []
+        guides = [str(x).strip() for x in guide if str(x).strip()]
+        if guides:
+            lines.append("[학습 가이드]")
+            for i, g in enumerate(guides[:5], start=1):
+                lines.append(f"- {i}) {g}")
+            lines.append("━━━━━━━━━━━━━━━")
+
+    if len(lines) <= 2:
+        for i, r in enumerate(reports[:10], start=1):
+            lines.append(f"{i}. {r.get('title','')} ({r.get('source','')} · {r.get('date','')})")
+            lines.append(f"링크: {r.get('pdf_link','') or r.get('detail_link','')}")
+            lines.append("━━━━━━━━━━━━━━━")
+
+    return "\n".join(lines[:-1] if lines and lines[-1] == "━━━━━━━━━━━━━━━" else lines)
+
+
 def build_news_digest_message(today: str, now_time: str, keywords: list[str], items: list[dict[str, str]]) -> str:
     lines = [f"📰 키워드 뉴스 요약 ({today} {now_time})", f"🔎 키워드: {', '.join(keywords)}", "━━━━━━━━━━━━━━━"]
     for i, it in enumerate(items, start=1):
@@ -1672,6 +2021,8 @@ def run_daily_report(
     usdkrw = fetch_usdkrw()
     market_rows_for_report = load_market_snapshot_rows(conn)
     market_brief_token = ""
+    economy_brief_token = ""
+    minute_now = now.hour * 60 + now.minute
     if web_base_url:
         market_brief_token = get_or_create_market_brief_report(
             conn,
@@ -1681,6 +2032,8 @@ def run_daily_report(
             naver_client_id,
             naver_client_secret,
         )
+        if minute_now >= 15 * 60:
+            economy_brief_token = get_or_create_economy_brief_report(conn, today, now_time)
 
     chat_cfgs = {}
     for cid in chat_ids:
@@ -1953,6 +2306,9 @@ def run_daily_report(
         buttons = []
         if market_brief_url:
             buttons.append({"text": "📰 마켓 브리프", "url": market_brief_url})
+        economy_brief_url = f"{web_base_url.rstrip('/')}/report/{economy_brief_token}" if (web_base_url and economy_brief_token) else ""
+        if economy_brief_url:
+            buttons.append({"text": "📘 경제분석 리포트", "url": economy_brief_url})
         if report_url:
             buttons.append({"text": "📊 종목 현황", "url": report_url})
         if manage_url:
@@ -1975,6 +2331,15 @@ def run_daily_report(
         else:
             tg.send_text(chat_id, short_msg)
 
+        if minute_now >= 16 * 60 and economy_brief_url and state.get("economy_brief_sent_date") != today:
+            tg.send_text_with_buttons(
+                chat_id,
+                f"📘 경제분석 리포트 ({today} {now_time})\n오늘자 리포트가 준비됐어요. 아래 버튼으로 확인하세요.",
+                [{"text": "📘 경제분석 리포트", "url": economy_brief_url}],
+            )
+            state["economy_brief_sent_date"] = today
+            save_state(conn, chat_id, state)
+
         if dirty:
             state["symbols"] = sym_states
             save_state(conn, chat_id, state)
@@ -1993,6 +2358,7 @@ def run_daily_report(
             naver_client_id,
             naver_client_secret,
         )
+
 
 
 def run_morning_card(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: list[str]):
@@ -2201,5 +2567,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
