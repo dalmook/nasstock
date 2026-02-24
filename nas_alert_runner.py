@@ -2106,7 +2106,7 @@ def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: l
         e = load_envelope(conn, sym, period, pct)
         if e:
             env_map[sym] = e
-    
+
     symbol_names: dict[str, str] = {}
     dft = cfg.get("default") if isinstance(cfg.get("default"), dict) else {}
     dft_tickers = dft.get("tickers") if isinstance(dft.get("tickers"), list) else []
@@ -2124,7 +2124,7 @@ def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: l
                 nn = str(t.get("name", "")).strip()
                 if ss and nn and ss not in symbol_names:
                     symbol_names[ss] = nn
-                    
+
     for chat_id in chat_ids:
         state = load_state(conn, chat_id)
         watch_state = state.get("envelope_watch", {}) if isinstance(state.get("envelope_watch"), dict) else {}
