@@ -1,0 +1,20 @@
+services:
+  stock-data-api:
+    build: .
+    container_name: stock-data-api
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - market_data_service:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      - DB_PATH=/data/stock_prices.db
+      - API_TOKEN=CHANGE_ME_STRONG_TOKEN
+    ports:
+      - "18080:8000"
+    volumes:
+      - ./data:/data
+      - ./chat-configs.js:/app/chat-configs.js:ro

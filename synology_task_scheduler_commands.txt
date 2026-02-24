@@ -1,0 +1,55 @@
+﻿# 0) 공통 변수(각 작업 스크립트 상단에 같이 넣어도 됨)
+# BOT_TOKEN: 텔레그램 봇 토큰
+# WEB_BASE_URL: 리포트/관리 웹 URL (예: https://your-nas-host:18080)
+# NAVER_CLIENT_ID / NAVER_CLIENT_SECRET: 네이버 검색 API 키 (데일리 리포트 뉴스요약용)
+# OPENAI_API_KEY: 공통 마켓 브리프 요약(gpt-5-mini)용 API 키
+
+# 0-1) 코드 변경 후 초기 반영 체크리스트 (중요)
+# 아래 순서로 실행해야 NAS 컨테이너 이미지/웹/리포트가 최신 코드로 반영됨
+# 1) SSH 접속 (예: ssh <user>@<your-nas-host>)
+# 2) 프로젝트 이동
+#    cd /volume1/docker/stock_alert
+# 3) NAS 서버 이미지 재빌드 (코드 변경 반영)
+#    /usr/local/bin/docker build -t stock-price-ingest:latest .
+# 4) 웹 UI 코드 변경이 있었으면 웹 컨테이너 재기동 (기존 컨테이너 교체)
+#    /usr/local/bin/docker rm -f stock-alert-web
+#    /usr/local/bin/docker run -d --name stock-alert-web --restart unless-stopped -p 18080:8000 \
+#      -e DB_PATH=/data/stock_prices.db -e SYMBOLS_FILE=/app/chat-configs.js \
+#      -v /volume1/docker/stock_alert/data:/data \
+#      -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro \
+#      stock-price-ingest:latest uvicorn nas_web_app:app --host 0.0.0.0 --port 8000
+# 5) 적재 작업 수동 1회 실행 (주요지표/최신시세 채우기)
+#    재빌드 후 최초 1회는 아래 순서 권장: daily -> intraday
+# 6) 알림 수동 테스트
+#    morning_card -> daily_report (뉴스요약 포함 여부 확인)
+# 7) DSM 작업 스케줄러 명령 수정사항 반영 확인
+#    - daily_report(#4)에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET / OPENAI_API_KEY 전달(-e) 필수
+#    - 스케줄러는 docker-compose.yml env를 자동으로 사용하지 않음
+
+# 0-2) 수동 검증 팁 (선택)
+# 주요지표현황이 '데이터 없음'이면 latest_quotes에 주요 심볼이 적재됐는지 확인
+# /usr/local/bin/docker run --rm -i -v /volume1/docker/stock_alert/data:/data stock-price-ingest:latest python - <<'PY'
+# import sqlite3
+# conn = sqlite3.connect('/data/stock_prices.db')
+# for sym in ["^KS11","^IXIC","BTC-USD","KRW=X","^TNX"]:
+#     print(sym, conn.execute("SELECT symbol, price, prev_close FROM latest_quotes WHERE symbol=?", (sym,)).fetchone())
+# conn.close()
+# PY
+
+# 1) 일봉 + 지표 적재 (매일 07:40)
+/usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/ingest_prices.py --mode daily --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --daily-period-days 420 --lookback-days 60
+
+# 2) 준실시간 적재 (평일 09:00~23:30, 30분 간격)
+/usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/ingest_prices.py --mode intraday --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --intraday-period 10d --intraday-interval 30m
+
+# 3) 모닝 카드 전송 (매일 07:45)
+BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'; /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/nas_alert_runner.py --task morning_card --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --telegram-token "$BOT_TOKEN"
+
+# 4) 데일리 리포트 전송 + 공통 마켓 브리프 생성/버튼 전송 (매일 07:50)
+BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'; WEB_BASE_URL='https://your-nas-host:18080'; NAVER_CLIENT_ID='YOUR_NAVER_CLIENT_ID'; NAVER_CLIENT_SECRET='YOUR_NAVER_CLIENT_SECRET'; OPENAI_API_KEY='YOUR_OPENAI_API_KEY'; /usr/local/bin/docker run --rm -e NAVER_CLIENT_ID="$NAVER_CLIENT_ID" -e NAVER_CLIENT_SECRET="$NAVER_CLIENT_SECRET" -e OPENAI_API_KEY="$OPENAI_API_KEY" -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/nas_alert_runner.py --task daily_report --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --telegram-token "$BOT_TOKEN" --web-base-url "$WEB_BASE_URL"
+
+# 5) Envelope 감시 (평일 09:00~15:30, 10분 간격)
+BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'; /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/nas_alert_runner.py --task envelope_watch --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --telegram-token "$BOT_TOKEN" --envelope-period 20 --envelope-pct 0.2
+
+# 6) 웹서비스 상시 실행(1회 실행 / 코드 변경 후 재기동 필요)
+/usr/local/bin/docker run -d --name stock-alert-web --restart unless-stopped -p 18080:8000 -e DB_PATH=/data/stock_prices.db -e SYMBOLS_FILE=/app/chat-configs.js -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest uvicorn nas_web_app:app --host 0.0.0.0 --port 8000
