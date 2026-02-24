@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import datetime as dt
 import json
 import logging
