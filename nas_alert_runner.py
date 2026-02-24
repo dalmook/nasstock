@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import datetime as dt
 import io
 import json
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from html import escape, unescape
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urljoin
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -26,6 +26,7 @@ DEFAULT_OVERSIZE_DROP_PCT = -0.05
 DEFAULT_OVERSIZE_BUY_SHARES = 1
 GLOBAL_BRIEF_CHAT_ID = "__MARKET_BRIEF__"
 MARKET_BRIEF_TEMPLATE_VERSION = "v2"
+ECONOMY_BRIEF_TEMPLATE_VERSION = "v3"
 
 NEWS_BUCKET_KEYWORDS: dict[str, tuple[str, ...]] = {
     "macro": (
@@ -983,7 +984,77 @@ def get_or_create_market_brief_report(
 
 
 def build_economy_brief_token(date_kst: str) -> str:
-    return f"economy-brief-{date_kst}"
+    return f"economy-brief-{ECONOMY_BRIEF_TEMPLATE_VERSION}-{date_kst}"
+
+
+def _is_naver_report_date_today(report_date: str, today_ymd: str) -> bool:
+    s = str(report_date or "").strip()
+    if not s or not today_ymd:
+        return False
+    try:
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", s):
+            yy, mm, dd = [int(x) for x in s.split(".")]
+            target = dt.date(2000 + yy, mm, dd)
+            return target.strftime("%Y-%m-%d") == today_ymd
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return s == today_ymd
+    except Exception:
+        return False
+    return False
+
+
+def _fallback_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    topic_hints: list[str] = []
+    for r in reports[:8]:
+        title = str(r.get("title") or "").strip()
+        source = str(r.get("source") or "").strip()
+        date = str(r.get("date") or "").strip()
+        excerpt = str(r.get("pdf_excerpt") or "").strip()
+        pdf_link = str(r.get("pdf_link") or "").strip()
+        detail_link = str(r.get("detail_link") or "").strip()
+
+        # First 1-2 sentences worth of text for a deterministic local summary fallback.
+        cleaned = re.sub(r"\s+", " ", excerpt).strip()
+        summary = cleaned[:220].rstrip()
+        if len(cleaned) > 220:
+            summary += "…"
+        if not summary:
+            summary = "PDF 본문 추출이 비어 제목/기관 기준으로만 정리했습니다."
+
+        study_points: list[str] = []
+        for kw in ["관세", "금리", "물가", "고용", "환율", "성장", "GDP", "CPI", "PCE", "연준", "한국은행"]:
+            if kw.lower() in title.lower() or kw.lower() in cleaned.lower():
+                study_points.append(f"{kw} 관련 흐름 확인")
+            if len(study_points) >= 2:
+                break
+        if not study_points:
+            study_points = ["핵심 주장과 근거 분리", "정책/지표 영향 경로 확인"]
+
+        items.append(
+            {
+                "title": title,
+                "source": source,
+                "date": date,
+                "summary": summary,
+                "study_points": study_points,
+                "pdf_link": pdf_link,
+                "detail_link": detail_link,
+                "link": pdf_link or detail_link,
+            }
+        )
+        if title:
+            topic_hints.append(title)
+
+    overview = ""
+    if items:
+        srcs = sorted({str(it.get("source") or "").strip() for it in items if str(it.get("source") or "").strip()})
+        overview = f"오늘 등록 리포트 {len(items)}건을 제목/PDF 발췌 기준으로 정리했습니다."
+        if srcs:
+            overview += f" 주요 발행기관: {', '.join(srcs[:5])}"
+        overview += " 공통 주제와 숫자/정책 키워드를 중심으로 원문 확인을 권장합니다."
+
+    return {"overview": overview, "items": items, "study_guide": ["제목 → 핵심 주장 → 근거지표 순서로 읽기", "중복 주제는 기관별 시각 차이 비교", "수치/정책 일정은 원문 PDF에서 재확인"]}
 
 
 def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any], reports: list[dict[str, str]]) -> str:
@@ -997,7 +1068,7 @@ def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any],
         source = escape(str(it.get("source") or "").strip())
         date = escape(str(it.get("date") or "").strip())
         summary = escape(str(it.get("summary") or "").strip())
-        link = str(it.get("pdf_link") or it.get("detail_link") or "").strip()
+        link = str(it.get("pdf_link") or it.get("detail_link") or it.get("link") or "").strip()
         meta = " · ".join([x for x in [source, date] if x])
         h = f"<li><b>{i}. {title}</b>"
         if meta:
@@ -1035,11 +1106,16 @@ def get_or_create_economy_brief_report(conn: sqlite3.Connection, today: str, now
     existing = load_chat_report_html(conn, token)
     if existing:
         return token
-    reports = fetch_naver_economy_reports(limit=10)
+    reports = fetch_naver_economy_reports(limit=15)
+    reports = [r for r in reports if _is_naver_report_date_today(str(r.get("date") or ""), today)]
     if not reports:
         LOG.info("economy brief skipped: no reports for %s", today)
         return ""
     digest = openai_economy_report_digest(reports) if reports else {}
+    has_items = isinstance(digest, dict) and isinstance(digest.get("items"), list) and len(digest.get("items") or []) > 0
+    has_overview = isinstance(digest, dict) and bool(str(digest.get("overview") or "").strip())
+    if not (has_overview or has_items):
+        digest = _fallback_economy_report_digest(reports)
     html = render_economy_brief_html(today, now_time, digest if isinstance(digest, dict) else {}, reports)
     save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, html)
     return token
@@ -1614,7 +1690,17 @@ def _extract_pdf_text_excerpt(pdf_bytes: bytes, max_pages: int = 8, max_chars: i
     return text[:max_chars]
 
 
+def _naver_finance_abs_url(url: str) -> str:
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    return urljoin("https://finance.naver.com/research/", s)
+
+
 def _fetch_naver_report_pdf_info(detail_link: str) -> tuple[str, str]:
+    detail_link = _naver_finance_abs_url(detail_link)
     if not detail_link:
         return "", ""
     try:
@@ -1627,9 +1713,7 @@ def _fetch_naver_report_pdf_info(detail_link: str) -> tuple[str, str]:
     m = re.search(r'href="([^"]+\.pdf(?:\?[^"]*)?)"', html, flags=re.IGNORECASE)
     if not m:
         return "", ""
-    pdf_link = str(m.group(1)).strip()
-    if pdf_link.startswith("/"):
-        pdf_link = "https://finance.naver.com" + pdf_link
+    pdf_link = _naver_finance_abs_url(str(m.group(1)).strip())
     if not pdf_link.startswith("http"):
         return "", ""
 
@@ -1662,9 +1746,7 @@ def fetch_naver_economy_reports(limit: int = 10) -> list[dict[str, str]]:
         title_m = re.search(r'<a[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>', tr, flags=re.IGNORECASE | re.DOTALL)
         if not title_m:
             continue
-        detail_link = _clean_news_text(title_m.group("href"), limit=300)
-        if detail_link.startswith("/"):
-            detail_link = "https://finance.naver.com" + detail_link
+        detail_link = _naver_finance_abs_url(_clean_news_text(title_m.group("href"), limit=300))
         title = _clean_news_text(title_m.group("title"), limit=120)
 
         tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.IGNORECASE | re.DOTALL)
@@ -1697,9 +1779,28 @@ def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any
     api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
     if not api_key or not reports:
         return None
+    llm_reports: list[dict[str, str]] = []
+    for r in reports[:8]:
+        if not isinstance(r, dict):
+            continue
+        excerpt = str(r.get("pdf_excerpt") or "").strip()
+        excerpt = re.sub(r"\s+", " ", excerpt)
+        # Keep only the high-signal front portion to reduce prompt tokens while preserving key context.
+        if len(excerpt) > 900:
+            excerpt = excerpt[:900].rstrip() + "…"
+        llm_reports.append(
+            {
+                "date": str(r.get("date") or "").strip(),
+                "source": str(r.get("source") or "").strip(),
+                "title": str(r.get("title") or "").strip(),
+                "detail_link": str(r.get("detail_link") or "").strip(),
+                "pdf_link": str(r.get("pdf_link") or "").strip(),
+                "pdf_excerpt": excerpt,
+            }
+        )
     payload = {
         "date_kst": fmt_date_kst(now_kst()),
-        "reports": reports,
+        "reports": llm_reports,
         "output_format": {
             "overview": "오늘의 경제분석 리포트 흐름 요약 3~5문장",
             "items": [{"title": "", "source": "", "date": "", "summary": "", "study_points": ["", "", ""], "link": ""}],
@@ -1708,11 +1809,12 @@ def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any
         "rules": [
             "한국어",
             "JSON object only",
-            "items는 최대 10개",
-            "각 summary는 3~4문장",
-            "study_points는 학습 포인트 2~3개",
+            "items는 최대 8개",
+            "각 summary는 2~3문장, 핵심 근거 중심",
+            "study_points는 학습 포인트 2개 위주(중복 금지)",
             "입력 목록 외 내용 추정 금지",
             "pdf_excerpt가 비어있으면 제목/기관/날짜만 보수적으로 요약",
+            "중요 숫자/정책/지표 키워드가 보이면 우선 반영",
         ],
     }
     req_body = {
@@ -1723,7 +1825,7 @@ def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any
             {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]},
         ],
         "text": {"format": {"type": "json_object"}},
-        "max_output_tokens": 2600,
+        "max_output_tokens": 1800,
     }
     try:
         req = Request(
@@ -2567,4 +2669,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
