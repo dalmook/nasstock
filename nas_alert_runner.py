@@ -614,12 +614,15 @@ def _log_openai_cost_estimate(tag: str, usage: dict[str, int | None], extra: str
     )
 
 
-def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_payload: list[dict[str, Any]]) -> dict[str, Any] | None:
+def openai_market_brief_json(
+    headlines_payload: dict[str, Any], indicators_payload: list[dict[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None]:
     api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
     model = (os.getenv("OPENAI_MARKET_BRIEF_MODEL", "") or "").strip() or "gpt-5-mini"
     if not api_key:
-        LOG.info("openai market_brief skipped: missing OPENAI_API_KEY")
-        return None
+        reason = "missing OPENAI_API_KEY"
+        LOG.info("openai market_brief skipped: %s", reason)
+        return None, reason
 
     system_prompt = (
         "한국어 금융 브리프 편집자. 기사 본문 금지. 입력 헤드라인/설명/지표만 사용. "
@@ -693,7 +696,9 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
             if not txt:
                 raise RuntimeError("empty OpenAI JSON text")
             parsed = json.loads(txt)
-            return parsed if isinstance(parsed, dict) else None
+            if isinstance(parsed, dict):
+                return parsed, None
+            return None, "OpenAI response is not a JSON object"
         except HTTPError as e:
             last_err = e
             err_detail = ""
@@ -705,6 +710,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
                 err_detail = ""
 
             code = int(getattr(e, "code", 0) or 0)
+            last_err = RuntimeError(f"HTTP {code} model={model} detail={(err_detail or str(e))[:240]}")
             LOG.warning(
                 "openai market_brief http_error status=%s model=%s attempt=%s detail=%s",
                 code,
@@ -724,7 +730,8 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
             continue
     if last_err:
         LOG.warning("openai market brief failed: %s", last_err)
-    return None
+        return None, str(last_err)
+    return None, "unknown OpenAI market_brief failure"
 
 
 def _bucket_score(text: str, bucket: str) -> int:
@@ -1091,7 +1098,14 @@ def get_or_create_market_brief_report(
 
     headlines = collect_market_brief_headlines(naver_client_id, naver_client_secret, per_bucket_limit=20)
     indicators_payload = build_market_brief_indicators_payload(market_rows)
-    brief_json = openai_market_brief_json(headlines, indicators_payload) or fallback_market_brief_json(headlines, indicators_payload)
+    brief_json, brief_error = openai_market_brief_json(headlines, indicators_payload)
+    if not brief_json:
+        LOG.warning("market_brief fallback engaged reason=%s", brief_error or "unknown")
+        brief_json = fallback_market_brief_json(headlines, indicators_payload)
+        if brief_error:
+            brief_json["execution_note"] = (
+                f"자동 요약 실패로 fallback 브리프를 사용했습니다. 원인: {brief_error[:160]}"
+            )
     html = render_market_brief_html(today, now_time, brief_json, market_rows)
     save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, html)
     return token
@@ -1559,9 +1573,9 @@ def render_chat_report_html(
     groups = [
         ("ߓ蠬㼬ꔠ지수", {"^KS11", "^KQ11", "^N225", "^DJI", "^IXIC", "^GSPC", "000001.SS", "^HSI"}),
         ("ߪ頬됬암호", {"BTC-USD", "GC=F", "CL=F"}),
-        ("ߒᠭ阬쨢, {"KRW=X"}),
-        ("ߏ株舫欢, {"^TNX"}),
-        ("ߧ頪谭〢, set()),
+        ("환율", {"KRW=X"}),
+        ("금리", {"^TNX"}),
+        ("기타", set()),
     ]
     market_cards: list[str] = []
     for title, syms in groups:
@@ -2097,19 +2111,19 @@ def rsi_signal(v: float | None) -> tuple[str, str]:
     if v is None:
         return "⚪", "RSI 데이터 부족"
     if v <= 30:
-        return "ߟ⢬ "매수 추천(<=30)"
+        return "🟢", "매수 추천(<=30)"
     if v >= 70:
-        return "ߔ䢬 "매도 추천(>=70)"
-    return "ߟ᢬ "중립(30~70)"
+        return "🔴", "매도 추천(>=70)"
+    return "🟡", "중립(30~70)"
 
 
 def stoch_rsi_signal(v: float | None) -> tuple[str, str]:
     if v is None:
         return "⚪", "데이터 부족"
     if v < 20:
-        return "ߟ⢬ "매수 후보(<20)"
+        return "🟢", "매수 후보(<20)"
     if v > 80:
-        return "ߔ䢬 "매도 경계(>80)"
+        return "🔴", "매도 경계(>80)"
     return "⚪", "중립(20~80)"
 
 
@@ -2117,17 +2131,17 @@ def macd_signal(macd: float | None, signal: float | None) -> tuple[str, str]:
     if macd is None or signal is None:
         return "⚪", "데이터 부족"
     if macd > signal:
-        return "ߟ⢬ "상승 추세(MACD > Signal)"
-    return "ߔ䢬 "하락 추세(MACD < Signal)"
+        return "🟢", "상승 추세(MACD > Signal)"
+    return "🔴", "하락 추세(MACD < Signal)"
 
 
 def adx_signal(adx: float | None) -> tuple[str, str]:
     if adx is None:
         return "⚪", "데이터 부족"
     if adx >= 25:
-        return "ߟ⢬ "강한 추세(>=25)"
+        return "🟢", "강한 추세(>=25)"
     if adx >= 20:
-        return "ߟ᢬ "추세 형성(20~25)"
+        return "🟡", "추세 형성(20~25)"
     return "⚪", "약한 추세(<20)"
 
 
@@ -2135,19 +2149,19 @@ def high52w_signal(drawdown: float | None) -> tuple[str, str]:
     if drawdown is None:
         return "⚪", "데이터 부족"
     if drawdown <= -0.2:
-        return "ߟ⢬ "장기 심리 위축(역발상 후보)"
+        return "🟢", "장기 심리 위축(역발상 후보)"
     if drawdown >= -0.05:
-        return "ߔ䢬 "52주 고점 근접(과열 주의)"
-    return "ߟ᢬ "중립 구간"
+        return "🔴", "52주 고점 근접(과열 주의)"
+    return "🟡", "중립 구간"
 
 
 def bollinger_signal(price: float | None, middle: float | None, upper: float | None, lower: float | None) -> str:
     if price is None or upper is None or lower is None or middle is None:
         return "⚪ Bollinger: 데이터 부족"
     if price <= lower:
-        return "ߟ⠭嘫먠밴드 터치(단기 반등 후보)"
+        return "🟢 하단 밴드 터치(단기 반등 후보)"
     if price >= upper:
-        return "ߔ䠬に먠밴드 터치(과열 경고)"
+        return "🔴 상단 밴드 터치(과열 경고)"
     return "⚪ 밴드 내부(중립)"
 
 
@@ -2169,12 +2183,12 @@ def total_score(rsi: float | None, stoch: float | None, macd: float | None, macd
 def score_label(score: int, maxv: int) -> tuple[str, str]:
     ratio = score / maxv if maxv else 0
     if ratio >= 0.75:
-        return "ߟ⢬ "강매수 구간"
+        return "🟢", "강매수 구간"
     if ratio >= 0.5:
-        return "ߟ⢬ "매수 우위"
+        return "🟢", "매수 우위"
     if ratio >= 0.25:
-        return "ߟ᢬ "중립/관망"
-    return "ߔ䢬 "보수적 접근"
+        return "🟡", "중립/관망"
+    return "🔴", "보수적 접근"
 
 
 def load_latest_snapshots(conn: sqlite3.Connection, symbols: list[str], lookback: int) -> dict[str, dict[str, Any]]:
@@ -2626,7 +2640,7 @@ def run_morning_card(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: lis
 
     lines = [f"☀️ 모닝 마켓 브리핑 ({today} {now_time})", "━━━━━━━━━━━━━━━"]
     for r in rows:
-        up = "ߔꢠif (r["change"] or 0) > 0 else "ߔ�if (r["change"] or 0) < 0 else "⏺"
+        up = "📈" if (r["change"] or 0) > 0 else "📉" if (r["change"] or 0) < 0 else "⏺"
         p = f"{r['price']:,.{r['digits']}f}"
         c = "N/A" if r["change"] is None else f"{r['change']:+,.{r['digits']}f}"
         pct = "N/A" if r["change_pct"] is None else f"{r['change_pct']*100:+.2f}%"
