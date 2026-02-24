@@ -614,11 +614,15 @@ def _log_openai_cost_estimate(tag: str, usage: dict[str, int | None], extra: str
     )
 
 
-def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_payload: list[dict[str, Any]]) -> dict[str, Any] | None:
+def openai_market_brief_json(
+    headlines_payload: dict[str, Any], indicators_payload: list[dict[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None]:
     api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    model = (os.getenv("OPENAI_MARKET_BRIEF_MODEL", "") or "").strip() or "gpt-5-mini"
     if not api_key:
-        LOG.info("openai market_brief skipped: missing OPENAI_API_KEY")
-        return None
+        reason = "missing OPENAI_API_KEY"
+        LOG.info("openai market_brief skipped: %s", reason)
+        return None, reason
 
     system_prompt = (
         "한국어 금융 브리프 편집자. 기사 본문 금지. 입력 헤드라인/설명/지표만 사용. "
@@ -655,7 +659,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
     }
 
     req_body = {
-        "model": "gpt-5-mini",
+        "model": model,
         "reasoning": {"effort": "low"},
         "input": [
             {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
@@ -692,15 +696,42 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
             if not txt:
                 raise RuntimeError("empty OpenAI JSON text")
             parsed = json.loads(txt)
-            return parsed if isinstance(parsed, dict) else None
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
+            if isinstance(parsed, dict):
+                return parsed, None
+            return None, "OpenAI response is not a JSON object"
+        except HTTPError as e:
+            last_err = e
+            err_detail = ""
+            try:
+                err_raw = e.read().decode("utf-8", errors="ignore")
+                if err_raw:
+                    err_detail = err_raw[:700]
+            except Exception:
+                err_detail = ""
+
+            code = int(getattr(e, "code", 0) or 0)
+            last_err = RuntimeError(f"HTTP {code} model={model} detail={(err_detail or str(e))[:240]}")
+            LOG.warning(
+                "openai market_brief http_error status=%s model=%s attempt=%s detail=%s",
+                code,
+                model,
+                attempt + 1,
+                err_detail or str(e),
+            )
+            if 400 <= code < 500 and code != 429:
+                break
+            sleep_s = min(8.0, (2**attempt) + 0.3)
+            time.sleep(sleep_s)
+            continue
+        except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
             last_err = e
             sleep_s = min(8.0, (2**attempt) + 0.3)
             time.sleep(sleep_s)
             continue
     if last_err:
         LOG.warning("openai market brief failed: %s", last_err)
-    return None
+        return None, str(last_err)
+    return None, "unknown OpenAI market_brief failure"
 
 
 def _bucket_score(text: str, bucket: str) -> int:
@@ -948,7 +979,7 @@ def render_market_brief_html(
     <tr><td align="center">
       <table role="presentation" width="720" cellpadding="0" cellspacing="0" class="mb-shell" style="width:720px;max-width:100%;">
         <tr><td style="padding:0 0 12px 0;">
-          <div style="font-size:13px;color:#6b7280;">ߓorning Market Brief · All-in-One</div>
+          <div style="font-size:13px;color:#6b7280;">📊 Morning Market Brief · All-in-One</div>
           <div class="mb-title" style="font-size:28px;font-weight:900;line-height:1.2;margin:6px 0 0 0;">{escape(today)} {escape(now_time)} KST</div>
           <div style="font-size:13px;color:#6b7280;margin-top:6px;">범위: 전일 미국 마감 + 금일 한국 개장 전 · 공통 1회 생성</div>
         </td></tr>
@@ -995,7 +1026,7 @@ def render_market_brief_html(
             <tr>
               <td class="mb-dash-col mb-pad-r" style="width:50%;vertical-align:top;padding-right:8px;">
                 <div style="padding:12px;border-radius:14px;background:#f9fafb;border:1px solid #eef2f7;">
-                  <div style="font-size:13px;font-weight:900;margin-bottom:8px;">߇갟縠미국 (전일 마감)</div>
+                  <div style="font-size:13px;font-weight:900;margin-bottom:8px;">🇺🇸 미국 (전일 마감)</div>
                   <div style="font-size:13px;line-height:1.7;">
                     S&P 500: <b>{escape(line_for("^GSPC"))}</b><br/>
                     NASDAQ: <b>{escape(line_for("^IXIC"))}</b><br/>
@@ -1006,7 +1037,7 @@ def render_market_brief_html(
               </td>
               <td class="mb-dash-col mb-pad-l" style="width:50%;vertical-align:top;padding-left:8px;">
                 <div style="padding:12px;border-radius:14px;background:#f9fafb;border:1px solid #eef2f7;">
-                  <div style="font-size:13px;font-weight:900;margin-bottom:8px;">߇ట締한국 (개장 전 프리뷰)</div>
+                  <div style="font-size:13px;font-weight:900;margin-bottom:8px;">🇰🇷 한국 (개장 전 프리뷰)</div>
                   <div style="font-size:13px;line-height:1.7;">
                     KOSPI: <b>{escape(line_for("^KS11"))}</b><br/>
                     KOSDAQ: <b>{escape(line_for("^KQ11"))}</b><br/>
@@ -1018,7 +1049,7 @@ def render_market_brief_html(
             </tr>
           </table>
           <div style="padding:12px;border-radius:14px;background:#f9fafb;border:1px solid #eef2f7;">
-            <div style="font-size:13px;font-weight:900;margin-bottom:8px;">ߓ젭嵬묠지표</div>
+            <div style="font-size:13px;font-weight:900;margin-bottom:8px;">📊 주요 지표</div>
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;line-height:1.7;">
               <tr>{indicator_lines[0]}{indicator_lines[1]}</tr>
               <tr>{indicator_lines[2]}{indicator_lines[3]}</tr>
@@ -1030,10 +1061,10 @@ def render_market_brief_html(
           <div style="font-size:14px;font-weight:900;margin-bottom:10px;">전일 주요 뉴스 요약 (헤드라인 압축)</div>
           <div style="font-size:12px;color:#6b7280;margin-bottom:12px;">Naver Search News 헤드라인/설명/링크 기반 압축 요약</div>
           <div class="mb-news-grid" style="display:flex;gap:10px;flex-wrap:wrap;">
-            {bucket_html("ߧࠫ礭ᬫᜯ정책", "macro")}
-            {bucket_html("߇갟縠미국 주식 뉴스", "us")}
-            {bucket_html("߇ట締한국 주식 뉴스", "kr")}
-            {bucket_html("ߌ�阬쨯원자재/지정학", "fx")}
+            {bucket_html("거시·정책", "macro")}
+            {bucket_html("미국 주식 뉴스", "us")}
+            {bucket_html("한국 주식 뉴스", "kr")}
+            {bucket_html("환율·원자재·지정학", "fx")}
           </div>
           <div style="margin-top:12px;padding:12px;border-radius:14px;background:#ecfeff;border:1px solid #cffafe;">
             <div style="font-size:13px;font-weight:900;margin-bottom:6px;">✅ 오늘 한 줄 실행 메모</div>
@@ -1067,7 +1098,14 @@ def get_or_create_market_brief_report(
 
     headlines = collect_market_brief_headlines(naver_client_id, naver_client_secret, per_bucket_limit=20)
     indicators_payload = build_market_brief_indicators_payload(market_rows)
-    brief_json = openai_market_brief_json(headlines, indicators_payload) or fallback_market_brief_json(headlines, indicators_payload)
+    brief_json, brief_error = openai_market_brief_json(headlines, indicators_payload)
+    if not brief_json:
+        LOG.warning("market_brief fallback engaged reason=%s", brief_error or "unknown")
+        brief_json = fallback_market_brief_json(headlines, indicators_payload)
+        if brief_error:
+            brief_json["execution_note"] = (
+                f"자동 요약 실패로 fallback 브리프를 사용했습니다. 원인: {brief_error[:160]}"
+            )
     html = render_market_brief_html(today, now_time, brief_json, market_rows)
     save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, html)
     return token
@@ -1182,7 +1220,7 @@ def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any],
     return f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/><title>경제분석 리포트 브리프</title></head>
 <body style='margin:0;padding:20px;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Noto Sans KR,sans-serif;color:#111827;'>
 <div style='max-width:780px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:18px;'>
-<div style='font-size:13px;color:#6b7280;'>ߓ蠅conomy Report Brief</div>
+<div style='font-size:13px;color:#6b7280;'>📚 Economy Report Brief</div>
 <div style='font-size:26px;font-weight:900;margin-top:6px;'>{escape(today)} {escape(now_time)} KST</div>
 <div style='font-size:13px;color:#6b7280;margin-top:4px;'>생성시각: 15시 이후 1회 · 발송시각: 16시 이후 1회</div>
 <div style='margin-top:14px;padding:12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;line-height:1.7;'>{overview or '요약 없음'}</div>
@@ -1533,11 +1571,11 @@ def render_chat_report_html(
     market_rows = market_rows or []
     candidate_brief = candidate_brief or {}
     groups = [
-        ("ߓ蠬㼬ꔠ지수", {"^KS11", "^KQ11", "^N225", "^DJI", "^IXIC", "^GSPC", "000001.SS", "^HSI"}),
-        ("ߪ頬됬암호", {"BTC-USD", "GC=F", "CL=F"}),
-        ("ߒᠭ阬쨢, {"KRW=X"}),
-        ("ߏ株舫欢, {"^TNX"}),
-        ("ߧ頪谭〢, set()),
+        ("지수", {"^KS11", "^KQ11", "^N225", "^DJI", "^IXIC", "^GSPC", "000001.SS", "^HSI"}),
+        ("암호자산/원자재", {"BTC-USD", "GC=F", "CL=F"}),
+        ("환율", {"KRW=X"}),
+        ("금리", {"^TNX"}),
+        ("기타", set()),
     ]
     market_cards: list[str] = []
     for title, syms in groups:
@@ -1663,7 +1701,7 @@ th.sticky-col{{z-index:3;background:#f8fafc}}
 <body><div class='wrap'>
 <div class='top'>
   <div>
-    <div class='title'>ߓ꠬Ⅻꩠ현황</div>
+    <div class='title'>📋 종목 현황</div>
     <div class='meta'>{escape(today)} {escape(now_time)}</div>
   </div>
   {manage_html}
@@ -1673,26 +1711,26 @@ th.sticky-col{{z-index:3;background:#f8fafc}}
   <div class='card'><div class='label'>매도 후보 리스트</div><div class='val'>{escape(', '.join(sell_list) if sell_list else '없음')}</div></div>
 </div>
 <div class='panel ai-panel'>
-  <h3>ߤ栭넫㴠브리핑</h3>
+  <h3>매매 브리핑</h3>
   <div class='ai-summary'>{escape(cb_summary or '후보 종목이 없거나 요약 데이터가 없습니다. 지표 기반 표를 우선 확인하세요.')}</div>
-  {brief_cards(cb_buy, "ߟ⠫礬蘠후보 브리핑", "buytone")}
-  {brief_cards(cb_sell, "ߔ䠫礫후보 브리핑", "selltone")}
+  {brief_cards(cb_buy, "매수 후보 브리핑", "buytone")}
+  {brief_cards(cb_sell, "매도 후보 브리핑", "selltone")}
 </div>
-<div class='section-title'>߇ట締한국 주식</div>
+<div class='section-title'>🇰🇷 한국 주식</div>
 <div class='scroll'>
 <table>
 <tr><th class='sticky-col'>종목</th><th>현재가</th><th>전일종가</th><th>등락률</th><th>RSI</th><th>StochRSI</th><th>MACD/Sig</th><th>ADX</th><th>52주고점비</th><th>Bollinger</th><th>Score</th></tr>
 {stock_table_rows(kr_rows) if kr_rows else "<tr><td colspan='11'>표시할 종목이 없습니다.</td></tr>"}
 </table>
 </div>
-<div class='section-title'>߇갟縠미국 주식</div>
+<div class='section-title'>🇺🇸 미국 주식</div>
 <div class='scroll'>
 <table>
 <tr><th class='sticky-col'>종목</th><th>현재가</th><th>전일종가</th><th>등락률</th><th>RSI</th><th>StochRSI</th><th>MACD/Sig</th><th>ADX</th><th>52주고점비</th><th>Bollinger</th><th>Score</th></tr>
 {stock_table_rows(us_rows) if us_rows else "<tr><td colspan='11'>표시할 종목이 없습니다.</td></tr>"}
 </table>
 </div>
-<div class='section-title'>ߓ젬㼬ꔬ瀭ᜭ脭驼/div>
+<div class='section-title'>📊 주요 지표</div>
 <div class='mgrid'>{''.join(market_cards)}</div>
 </div></body></html>"""
 
@@ -1957,7 +1995,7 @@ def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any
 
 def build_economy_report_digest_message(today: str, now_time: str, reports: list[dict[str, str]]) -> str:
     digest = openai_economy_report_digest(reports)
-    lines = [f"ߓ蠫䤬�℠경제분석 리포트 요약 ({today} {now_time})", "━━━━━━━━━━━━━━━"]
+    lines = [f"📚 경제분석 리포트 요약 ({today} {now_time})", "━━━━━━━━━━━━━━━"]
     if isinstance(digest, dict):
         overview = str(digest.get("overview", "")).strip()
         if overview:
@@ -1999,7 +2037,7 @@ def build_economy_report_digest_message(today: str, now_time: str, reports: list
 
 
 def build_news_digest_message(today: str, now_time: str, keywords: list[str], items: list[dict[str, str]]) -> str:
-    lines = [f"ߓ࠭⤬댫㜠뉴스 요약 ({today} {now_time})", f"ߔ⤬댫㜺 {', '.join(keywords)}", "━━━━━━━━━━━━━━━"]
+    lines = [f"📰 뉴스 요약 ({today} {now_time})", f"🔎 키워드: {', '.join(keywords)}", "━━━━━━━━━━━━━━━"]
     for i, it in enumerate(items, start=1):
         head = f"{i}. {it.get('title', '')}"
         if it.get("pub"):
@@ -2073,19 +2111,19 @@ def rsi_signal(v: float | None) -> tuple[str, str]:
     if v is None:
         return "⚪", "RSI 데이터 부족"
     if v <= 30:
-        return "ߟ⢬ "매수 추천(<=30)"
+        return "🟢", "매수 추천(<=30)"
     if v >= 70:
-        return "ߔ䢬 "매도 추천(>=70)"
-    return "ߟ᢬ "중립(30~70)"
+        return "🔴", "매도 추천(>=70)"
+    return "🟡", "중립(30~70)"
 
 
 def stoch_rsi_signal(v: float | None) -> tuple[str, str]:
     if v is None:
         return "⚪", "데이터 부족"
     if v < 20:
-        return "ߟ⢬ "매수 후보(<20)"
+        return "🟢", "매수 후보(<20)"
     if v > 80:
-        return "ߔ䢬 "매도 경계(>80)"
+        return "🔴", "매도 경계(>80)"
     return "⚪", "중립(20~80)"
 
 
@@ -2093,17 +2131,17 @@ def macd_signal(macd: float | None, signal: float | None) -> tuple[str, str]:
     if macd is None or signal is None:
         return "⚪", "데이터 부족"
     if macd > signal:
-        return "ߟ⢬ "상승 추세(MACD > Signal)"
-    return "ߔ䢬 "하락 추세(MACD < Signal)"
+        return "🟢", "상승 추세(MACD > Signal)"
+    return "🔴", "하락 추세(MACD < Signal)"
 
 
 def adx_signal(adx: float | None) -> tuple[str, str]:
     if adx is None:
         return "⚪", "데이터 부족"
     if adx >= 25:
-        return "ߟ⢬ "강한 추세(>=25)"
+        return "🟢", "강한 추세(>=25)"
     if adx >= 20:
-        return "ߟ᢬ "추세 형성(20~25)"
+        return "🟡", "추세 형성(20~25)"
     return "⚪", "약한 추세(<20)"
 
 
@@ -2111,19 +2149,19 @@ def high52w_signal(drawdown: float | None) -> tuple[str, str]:
     if drawdown is None:
         return "⚪", "데이터 부족"
     if drawdown <= -0.2:
-        return "ߟ⢬ "장기 심리 위축(역발상 후보)"
+        return "🟢", "장기 심리 위축(역발상 후보)"
     if drawdown >= -0.05:
-        return "ߔ䢬 "52주 고점 근접(과열 주의)"
-    return "ߟ᢬ "중립 구간"
+        return "🔴", "52주 고점 근접(과열 주의)"
+    return "🟡", "중립 구간"
 
 
 def bollinger_signal(price: float | None, middle: float | None, upper: float | None, lower: float | None) -> str:
     if price is None or upper is None or lower is None or middle is None:
         return "⚪ Bollinger: 데이터 부족"
     if price <= lower:
-        return "ߟ⠭嘫먠밴드 터치(단기 반등 후보)"
+        return "🟢 하단 밴드 터치(단기 반등 후보)"
     if price >= upper:
-        return "ߔ䠬に먠밴드 터치(과열 경고)"
+        return "🔴 상단 밴드 터치(과열 경고)"
     return "⚪ 밴드 내부(중립)"
 
 
@@ -2145,12 +2183,12 @@ def total_score(rsi: float | None, stoch: float | None, macd: float | None, macd
 def score_label(score: int, maxv: int) -> tuple[str, str]:
     ratio = score / maxv if maxv else 0
     if ratio >= 0.75:
-        return "ߟ⢬ "강매수 구간"
+        return "🟢", "강매수 구간"
     if ratio >= 0.5:
-        return "ߟ⢬ "매수 우위"
+        return "🟢", "매수 우위"
     if ratio >= 0.25:
-        return "ߟ᢬ "중립/관망"
-    return "ߔ䢬 "보수적 접근"
+        return "🟡", "중립/관망"
+    return "🔴", "보수적 접근"
 
 
 def load_latest_snapshots(conn: sqlite3.Connection, symbols: list[str], lookback: int) -> dict[str, dict[str, Any]]:
@@ -2271,9 +2309,9 @@ def run_daily_report(
 
         has_usd = any(currency_of(str(t.get("symbol", ""))) == "USD" for t in tickers if isinstance(t, dict))
 
-        header = [f"ߓ謬알림 ({today} {now_time})"]
+        header = [f"📢 알림 ({today} {now_time})"]
         if has_usd:
-            header.append(f"ߒᠭ阬쨺 1 USD ≈ {fmt_money(usdkrw, 'KRW')}" if usdkrw else "ߒᠭ阬쨺 조회 실패(USD 종목 일부 계산 제한)")
+            header.append(f"💱 환율: 1 USD ≈ {fmt_money(usdkrw, 'KRW')}" if usdkrw else "💱 환율 조회 실패(USD 종목 일부 계산 제한)")
         header.append("━━━━━━━━━━━━━━━")
 
         blocks_kr: list[str] = []
@@ -2295,7 +2333,7 @@ def run_daily_report(
 
             s = snap_map.get(sym)
             if not s:
-                fail_block = f"ߏ篸Ⅻꩫꅠ: {name} ({sym})\n❌ DB 데이터 없음 → 적재 후 재시도"
+                fail_block = f"🏷️ 종목: {name} ({sym})\n❌ DB 데이터 없음 → 적재 후 재시도"
                 report_stock_rows.append(
                     {
                         "symbol": sym,
@@ -2457,16 +2495,16 @@ def run_daily_report(
             )
 
             lines = [
-                f"ߏ篸Ⅻꩫꅠ: {name} ({sym})",
-                f"ߒ࠭脬: {fmt_money(s.get('curPrice') or ref_price, ccy)} ({fmt_pct_signed(s.get('curChgPct'))})",
-                f"ߧĬ�Ⅺ: {fmt_money(s.get('prevClose') or s.get('close1'), ccy)}",
-                f"ߏ䯸0일고점: {fmt_money(s.get('highN'), ccy)} (고점비 {fmt_pct_signed(s.get('highDrawdownPct'))})",
-                f"ߓ頒SI(14): {f'{rsi:.1f}' if rsi is not None else 'N/A'}  {s_rsi[0]} {s_rsi[1]}",
-                f"ߓꠓtoch RSI(14): {f'{stoch:.3f}' if stoch is not None else 'N/A'}  {s_stoch[0]} {s_stoch[1]}",
-                f"ߓ蠍ACD: {f'{macd:.4f}' if macd is not None else 'N/A'} / Signal: {f'{macd_sig:.4f}' if macd_sig is not None else 'N/A'}  {s_macd[0]} {s_macd[1]}",
+                f"🏷️ 종목: {name} ({sym})",
+                f"💰 현재가: {fmt_money(s.get('curPrice') or ref_price, ccy)} ({fmt_pct_signed(s.get('curChgPct'))})",
+                f"🕘 전일종가: {fmt_money(s.get('prevClose') or s.get('close1'), ccy)}",
+                f"📈 N일 고점: {fmt_money(s.get('highN'), ccy)} (고점비 {fmt_pct_signed(s.get('highDrawdownPct'))})",
+                f"📌 RSI(14): {f'{rsi:.1f}' if rsi is not None else 'N/A'}  {s_rsi[0]} {s_rsi[1]}",
+                f"📌 Stoch RSI(14): {f'{stoch:.3f}' if stoch is not None else 'N/A'}  {s_stoch[0]} {s_stoch[1]}",
+                f"📌 MACD: {f'{macd:.4f}' if macd is not None else 'N/A'} / Signal: {f'{macd_sig:.4f}' if macd_sig is not None else 'N/A'}  {s_macd[0]} {s_macd[1]}",
                 f"✔ ADX(14): {f'{adx:.1f}' if adx is not None else 'N/A'}  {s_adx[0]} {s_adx[1]}",
                 f"✔ 52주 고점비: {fmt_pct_signed(high52_dd)}  {s_high52[0]} {s_high52[1]}",
-                f"ߎollinger(20,2): {s_bb}",
+                f"📌 Bollinger(20,2): {s_bb}",
             ]
 
             th_text = f"{drop_th * 100:.1f}%"
@@ -2479,9 +2517,9 @@ def run_daily_report(
             else:
                 lines.append(f"⚡ 과대낙폭(전일비 <= {th_text}): ✅ 충족")
                 lines.append(
-                    f"   └ ߓ젬攬✺ {runtime.oversize_buy_shares}주 매수 {'✅' if oversize_ok else '⚠️'} (≈{fmt_money(ref_price, ccy)}) · {oversize_reason}"
+                    f"   └ 📦 추가매수 {runtime.oversize_buy_shares}주 {'✅' if oversize_ok else '⚠️'} (≈{fmt_money(ref_price, ccy)}) · {oversize_reason}"
                 )
-            lines.append(f"ߌⅭ婠스코어: {score} / {maxv}  → {score_text[0]} {score_text[1]}")
+            lines.append(f"📌 스코어: {score} / {maxv}  → {score_text[0]} {score_text[1]}")
 
             if ccy == "KRW":
                 blocks_kr.extend(["\n".join(lines), "━━━━━━━━━━━━━━━"])
@@ -2519,25 +2557,25 @@ def run_daily_report(
         market_brief_url = f"{web_base_url.rstrip('/')}/report/{market_brief_token}" if (web_base_url and market_brief_token) else ""
         buttons = []
         if market_brief_url:
-            buttons.append({"text": "ߓࠫ爬쓠브리프", "url": market_brief_url})
+            buttons.append({"text": "📄 브리프", "url": market_brief_url})
         economy_brief_url = f"{web_base_url.rstrip('/')}/report/{economy_brief_token}" if (web_base_url and economy_brief_token) else ""
         if economy_brief_url:
-            buttons.append({"text": "ߓ蠪⽬ܫ愬䝠리포트", "url": economy_brief_url})
+            buttons.append({"text": "📚 리포트", "url": economy_brief_url})
         if report_url:
-            buttons.append({"text": "ߓ꠬Ⅻꩠ현황", "url": report_url})
+            buttons.append({"text": "📋 현황", "url": report_url})
         if manage_url:
             buttons.append({"text": "⚙️ 내 종목 관리", "url": manage_url})
         short_msg_lines = [
-            f"ߓ謬알림 ({today} {now_time})",
-            f"ߟ⠫礬蘠후보: {', '.join(buy_list[:6]) if buy_list else '없음'}",
-            f"ߔ䠫礫후보: {', '.join(sell_list[:6]) if sell_list else '없음'}",
+            f"📢 알림 ({today} {now_time})",
+            f"매수 후보: {', '.join(buy_list[:6]) if buy_list else '없음'}",
+            f"매도 후보: {', '.join(sell_list[:6]) if sell_list else '없음'}",
         ]
         if len(buy_list) > 6:
             short_msg_lines.append(f"… 매수 후보 추가 {len(buy_list) - 6}개")
         if len(sell_list) > 6:
             short_msg_lines.append(f"… 매도 후보 추가 {len(sell_list) - 6}개")
         if has_usd:
-            short_msg_lines.append(f"ߒᠭ阬쨺 {fmt_money(usdkrw, 'KRW')}" if usdkrw else "ߒᠭ阬쨺 조회 실패")
+            short_msg_lines.append(f"💱 환율 {fmt_money(usdkrw, 'KRW')}" if usdkrw else "💱 환율 조회 실패")
         short_msg_lines.append("자세한 내용은 아래 버튼에서 확인하세요.")
         short_msg = "\n".join(short_msg_lines)
         if buttons:
@@ -2548,8 +2586,8 @@ def run_daily_report(
         if minute_now >= 16 * 60 and economy_brief_url and state.get("economy_brief_sent_date") != today:
             tg.send_text_with_buttons(
                 chat_id,
-                f"ߓ蠪⽬ܫ愬䝠리포트 ({today} {now_time})\n오늘자 리포트가 준비됐어요. 아래 버튼으로 확인하세요.",
-                [{"text": "ߓ蠪⽬ܫ愬䝠리포트", "url": economy_brief_url}],
+                f"📚 리포트 ({today} {now_time})\n오늘자 리포트가 준비됐어요. 아래 버튼으로 확인하세요.",
+                [{"text": "📚 리포트", "url": economy_brief_url}],
             )
             state["economy_brief_sent_date"] = today
             save_state(conn, chat_id, state)
@@ -2602,7 +2640,7 @@ def run_morning_card(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: lis
 
     lines = [f"☀️ 모닝 마켓 브리핑 ({today} {now_time})", "━━━━━━━━━━━━━━━"]
     for r in rows:
-        up = "ߔꢠif (r["change"] or 0) > 0 else "ߔ�if (r["change"] or 0) < 0 else "⏺"
+        up = "📈" if (r["change"] or 0) > 0 else "📉" if (r["change"] or 0) < 0 else "⏺"
         p = f"{r['price']:,.{r['digits']}f}"
         c = "N/A" if r["change"] is None else f"{r['change']:+,.{r['digits']}f}"
         pct = "N/A" if r["change_pct"] is None else f"{r['change_pct']*100:+.2f}%"
@@ -2722,13 +2760,13 @@ def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: l
                 watch_state[sym] = {"side": side, "ts": int(now.timestamp()), "date": today}
                 dirty = True
                 if side != "NONE":
-                    title = "ߟ⠭嘫먠터치" if side == "LOWER" else "ߔ䠬に먠터치"
+                    title = "하단 밴드 터치" if side == "LOWER" else "상단 밴드 터치"
                     alerts.append(
                         f"{title} {symbol_names.get(sym, sym)} ({sym})\n현재가: {fmt_money(price, 'KRW')}\nEnvelope({period}, {pct*100:.1f}): 상단 {fmt_money(envp['upper'], 'KRW')} / 하단 {fmt_money(envp['lower'], 'KRW')}"
                     )
 
         if alerts:
-            head = f"ߚ蠋OSPI200 Envelope 터치 ({today} {now_time})"
+            head = f"🔔 KOSPI200 Envelope 터치 ({today} {now_time})"
             tg.send_text(chat_id, "\n".join([head, "━━━━━━━━━━━━━━━"] + alerts))
 
         if dirty:
