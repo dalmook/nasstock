@@ -1015,6 +1015,8 @@ def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any],
             date = escape(str(r.get("date", "")))
             link = str(r.get("pdf_link") or r.get("detail_link") or "").strip()
             lis.append(f"<li><b>{i}. {title}</b> <span style='color:#6b7280;'>({source} · {date})</span>" + (f"<div><a href='{escape(link)}' target='_blank' rel='noopener noreferrer'>원문 링크</a></div>" if link else "") + "</li>")
+    if not lis:
+        lis.append("<li>금일 등록된 경제분석 리포트가 아직 없습니다.</li>")
 
     return f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/><title>경제분석 리포트 브리프</title></head>
 <body style='margin:0;padding:20px;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Noto Sans KR,sans-serif;color:#111827;'>
@@ -1034,6 +1036,9 @@ def get_or_create_economy_brief_report(conn: sqlite3.Connection, today: str, now
     if existing:
         return token
     reports = fetch_naver_economy_reports(limit=10)
+    if not reports:
+        LOG.info("economy brief skipped: no reports for %s", today)
+        return ""
     digest = openai_economy_report_digest(reports) if reports else {}
     html = render_economy_brief_html(today, now_time, digest if isinstance(digest, dict) else {}, reports)
     save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, html)
@@ -1647,27 +1652,44 @@ def fetch_naver_economy_reports(limit: int = 10) -> list[dict[str, str]]:
     with urlopen(req, timeout=25) as resp:
         html = resp.read().decode("euc-kr", errors="ignore")
 
-    rows = re.findall(
-        r'<tr>\s*<td class="date">(?P<date>[^<]+)</td>\s*<td class="source">(?P<source>[^<]+)</td>\s*<td class="report"><a href="(?P<href>[^"]+)">(?P<title>[^<]+)</a></td>',
-        html,
-        flags=re.IGNORECASE,
-    )
+    # 네이버 리서치 테이블 구조: 제목 | 증권사 | 첨부 | 작성일 | 조회수
+    tr_blocks = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE | re.DOTALL)
     out: list[dict[str, str]] = []
-    for date, source, href, title in rows[:count]:
-        detail_link = href.strip()
+    for tr in tr_blocks:
+        if "<a" not in tr or "pdf" not in tr.lower():
+            continue
+
+        title_m = re.search(r'<a[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>', tr, flags=re.IGNORECASE | re.DOTALL)
+        if not title_m:
+            continue
+        detail_link = _clean_news_text(title_m.group("href"), limit=300)
         if detail_link.startswith("/"):
             detail_link = "https://finance.naver.com" + detail_link
+        title = _clean_news_text(title_m.group("title"), limit=120)
+
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.IGNORECASE | re.DOTALL)
+        cols = [_clean_news_text(td, limit=120) for td in tds]
+        source = cols[1] if len(cols) >= 2 else ""
+        # 작성일이 보통 4번째 열(예: 26.02.24)
+        date = cols[3] if len(cols) >= 4 else ""
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", date or ""):
+            cand = next((c for c in cols if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", c)), "")
+            date = cand
+
         pdf_link, pdf_excerpt = _fetch_naver_report_pdf_info(detail_link)
         out.append(
             {
-                "date": _clean_news_text(date, limit=20),
-                "source": _clean_news_text(source, limit=40),
-                "title": _clean_news_text(title, limit=120),
+                "date": date,
+                "source": source,
+                "title": title,
                 "detail_link": detail_link,
                 "pdf_link": pdf_link,
                 "pdf_excerpt": _clean_news_text(pdf_excerpt, limit=3500),
             }
         )
+        if len(out) >= count:
+            break
+
     return out
 
 
