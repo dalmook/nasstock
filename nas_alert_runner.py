@@ -616,6 +616,7 @@ def _log_openai_cost_estimate(tag: str, usage: dict[str, int | None], extra: str
 
 def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_payload: list[dict[str, Any]]) -> dict[str, Any] | None:
     api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    model = (os.getenv("OPENAI_MARKET_BRIEF_MODEL", "") or "").strip() or "gpt-5-mini"
     if not api_key:
         LOG.info("openai market_brief skipped: missing OPENAI_API_KEY")
         return None
@@ -655,7 +656,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
     }
 
     req_body = {
-        "model": "gpt-5-mini",
+        "model": model,
         "reasoning": {"effort": "low"},
         "input": [
             {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
@@ -693,7 +694,30 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
                 raise RuntimeError("empty OpenAI JSON text")
             parsed = json.loads(txt)
             return parsed if isinstance(parsed, dict) else None
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
+        except HTTPError as e:
+            last_err = e
+            err_detail = ""
+            try:
+                err_raw = e.read().decode("utf-8", errors="ignore")
+                if err_raw:
+                    err_detail = err_raw[:700]
+            except Exception:
+                err_detail = ""
+
+            code = int(getattr(e, "code", 0) or 0)
+            LOG.warning(
+                "openai market_brief http_error status=%s model=%s attempt=%s detail=%s",
+                code,
+                model,
+                attempt + 1,
+                err_detail or str(e),
+            )
+            if 400 <= code < 500 and code != 429:
+                break
+            sleep_s = min(8.0, (2**attempt) + 0.3)
+            time.sleep(sleep_s)
+            continue
+        except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
             last_err = e
             sleep_s = min(8.0, (2**attempt) + 0.3)
             time.sleep(sleep_s)
