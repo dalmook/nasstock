@@ -24,6 +24,75 @@ DEFAULT_OVERSIZE_BUY_SHARES = 1
 GLOBAL_BRIEF_CHAT_ID = "__MARKET_BRIEF__"
 MARKET_BRIEF_TEMPLATE_VERSION = "v2"
 
+NEWS_BUCKET_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "macro": (
+        "연준",
+        "fomc",
+        "cpi",
+        "pce",
+        "고용",
+        "실업",
+        "금리",
+        "기준금리",
+        "국채",
+        "재정",
+        "관세",
+        "fed",
+        "ecb",
+        "boj",
+    ),
+    "us": (
+        "나스닥",
+        "s&p",
+        "다우",
+        "뉴욕증시",
+        "미국증시",
+        "테슬라",
+        "엔비디아",
+        "애플",
+        "마이크로소프트",
+        "아마존",
+        "메타",
+        "알파벳",
+        "nasdaq",
+        "wall street",
+        "earnings",
+        "us stock",
+    ),
+    "kr": (
+        "코스피",
+        "코스닥",
+        "국내증시",
+        "한국증시",
+        "상한가",
+        "하한가",
+        "삼성전자",
+        "sk하이닉스",
+        "외국인",
+        "기관",
+        "개인",
+        "공매도",
+        "krx",
+    ),
+    "fx": (
+        "환율",
+        "원달러",
+        "달러",
+        "달러인덱스",
+        "dxy",
+        "유가",
+        "wti",
+        "브렌트",
+        "금값",
+        "구리",
+        "천연가스",
+        "중동",
+        "전쟁",
+        "지정학",
+        "원자재",
+    ),
+}
+
 MORNING_CARD_ITEMS = [
     {"symbol": "^KS11", "name": "코스피", "digits": 2},
     {"symbol": "^KQ11", "name": "코스닥", "digits": 2},
@@ -467,7 +536,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
 
     system_prompt = (
         "한국어 금융 브리프 편집자. 기사 본문 금지. 입력 헤드라인/설명/지표만 사용. "
-        "중복 제거·압축하고 JSON만 출력."
+        "중복 제거·압축하고 JSON만 출력. 카테고리 혼입 금지."
     )
     schema_hint = {
         "tldr": ["문장", "문장", "문장"],
@@ -492,6 +561,7 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
             "JSON object only",
             "no markdown",
             "bucket당 2~4개 포인트",
+            "카테고리 혼입 금지(미국/한국/거시/환율·원자재 엄격 분리)",
             "링크는 대표 1~3개",
             "점수는 0~10 정수",
             "불확실하면 보수적 표현",
@@ -539,6 +609,23 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
     return None
 
 
+def _bucket_score(text: str, bucket: str) -> int:
+    keywords = NEWS_BUCKET_KEYWORDS.get(bucket, ())
+    if not keywords:
+        return 0
+    low = text.lower()
+    return sum(1 for kw in keywords if kw in low)
+
+
+def _guess_news_bucket(title: str, summary: str) -> str | None:
+    text = f"{title} {summary}".strip()
+    if not text:
+        return None
+    scores = {b: _bucket_score(text, b) for b in NEWS_BUCKET_KEYWORDS.keys()}
+    best_bucket = max(scores, key=lambda b: scores[b])
+    return best_bucket if scores[best_bucket] > 0 else None
+
+
 def _news_bucket_queries() -> dict[str, list[str]]:
     return {
         "macro": ["연준 금리 CPI 고용 미국채", "FOMC inflation bond yield"],
@@ -554,8 +641,9 @@ def collect_market_brief_headlines(
     buckets: dict[str, list[dict[str, str]]] = {k: [] for k in _news_bucket_queries().keys()}
     if not naver_client_id or not naver_client_secret:
         return buckets
+
+    per_bucket_links: dict[str, set[str]] = {k: set() for k in buckets.keys()}
     for bucket, queries in _news_bucket_queries().items():
-        seen: set[str] = set()
         for q in queries:
             try:
                 rows = fetch_naver_news(naver_client_id, naver_client_secret, q, display=20)
@@ -564,13 +652,19 @@ def collect_market_brief_headlines(
                 continue
             for r in rows:
                 link = str(r.get("link", "")).strip()
-                if not link or link in seen:
+                title = str(r.get("title", "")).strip()
+                summary = _clean_news_text(r.get("summary", ""), limit=100)
+                if not link or not title:
                     continue
-                seen.add(link)
+                if _guess_news_bucket(title, summary) != bucket:
+                    continue
+                if link in per_bucket_links[bucket]:
+                    continue
+                per_bucket_links[bucket].add(link)
                 buckets[bucket].append(
                     {
-                        "title": str(r.get("title", "")),
-                        "description": _clean_news_text(r.get("summary", ""), limit=100),
+                        "title": title,
+                        "description": summary,
                         "link": link,
                         "pubDate": str(r.get("pub", "")),
                     }
@@ -1435,6 +1529,127 @@ def fetch_naver_news(client_id: str, client_secret: str, query: str, display: in
     return out
 
 
+def fetch_naver_economy_reports(limit: int = 10) -> list[dict[str, str]]:
+    count = max(1, min(int(limit), 10))
+    url = "https://finance.naver.com/research/economy_list.naver"
+    req = Request(
+        url,
+        headers={"user-agent": "Mozilla/5.0", "accept": "text/html,application/xhtml+xml"},
+    )
+    with urlopen(req, timeout=25) as resp:
+        html = resp.read().decode("euc-kr", errors="ignore")
+
+    rows = re.findall(
+        r'<tr>\s*<td class="date">(?P<date>[^<]+)</td>\s*<td class="source">(?P<source>[^<]+)</td>\s*<td class="report"><a href="(?P<href>[^"]+)">(?P<title>[^<]+)</a></td>',
+        html,
+        flags=re.IGNORECASE,
+    )
+    out: list[dict[str, str]] = []
+    for date, source, href, title in rows[:count]:
+        link = href.strip()
+        if link.startswith("/"):
+            link = "https://finance.naver.com" + link
+        out.append(
+            {
+                "date": _clean_news_text(date, limit=20),
+                "source": _clean_news_text(source, limit=40),
+                "title": _clean_news_text(title, limit=120),
+                "link": link,
+            }
+        )
+    return out
+
+
+def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any] | None:
+    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if not api_key or not reports:
+        return None
+    payload = {
+        "date_kst": fmt_date_kst(now_kst()),
+        "reports": reports,
+        "output_format": {
+            "overview": "오늘의 경제분석 리포트 흐름 요약 3~5문장",
+            "items": [{"title": "", "source": "", "date": "", "summary": "", "study_points": ["", "", ""], "link": ""}],
+            "study_guide": ["", "", ""],
+        },
+        "rules": [
+            "한국어",
+            "JSON object only",
+            "items는 최대 10개",
+            "각 summary는 3~4문장",
+            "study_points는 학습 포인트 2~3개",
+            "입력 목록 외 내용 추정 금지",
+        ],
+    }
+    req_body = {
+        "model": "gpt-5-mini",
+        "reasoning": {"effort": "low"},
+        "input": [
+            {"role": "system", "content": [{"type": "text", "text": "거시경제 리서치 튜터. 입력 목록을 학습용으로 구조화하고 JSON만 출력."}]},
+            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]},
+        ],
+        "text": {"format": {"type": "json_object"}},
+        "max_output_tokens": 2600,
+    }
+    try:
+        req = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=70) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        parsed = json.loads(_openai_extract_json_text(json.loads(raw)).strip())
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as e:
+        LOG.warning("openai economy digest failed: %s", e)
+        return None
+
+
+def build_economy_report_digest_message(today: str, now_time: str, reports: list[dict[str, str]]) -> str:
+    digest = openai_economy_report_digest(reports)
+    lines = [f"📘 네이버 경제분석 리포트 요약 ({today} {now_time})", "━━━━━━━━━━━━━━━"]
+    if isinstance(digest, dict):
+        overview = str(digest.get("overview", "")).strip()
+        if overview:
+            lines.extend(["[오늘의 흐름]", overview, "━━━━━━━━━━━━━━━"])
+        items = digest.get("items") if isinstance(digest.get("items"), list) else []
+        for idx, it in enumerate(items[:10], start=1):
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "(제목 없음)").strip()
+            source = str(it.get("source") or "").strip()
+            date = str(it.get("date") or "").strip()
+            summary = str(it.get("summary") or "").strip()
+            link = str(it.get("link") or "").strip()
+            pts = [str(x).strip() for x in (it.get("study_points") or []) if str(x).strip()]
+            meta = " · ".join([x for x in [source, date] if x])
+            lines.append(f"{idx}. {title}" + (f" ({meta})" if meta else ""))
+            if summary:
+                lines.append(f"요약: {summary}")
+            if pts:
+                lines.append("학습포인트: " + " / ".join(pts[:3]))
+            if link:
+                lines.append(f"링크: {link}")
+            lines.append("━━━━━━━━━━━━━━━")
+        guide = digest.get("study_guide") if isinstance(digest.get("study_guide"), list) else []
+        guides = [str(x).strip() for x in guide if str(x).strip()]
+        if guides:
+            lines.append("[학습 가이드]")
+            for i, g in enumerate(guides[:5], start=1):
+                lines.append(f"- {i}) {g}")
+            lines.append("━━━━━━━━━━━━━━━")
+
+    if len(lines) <= 2:
+        for i, r in enumerate(reports[:10], start=1):
+            lines.append(f"{i}. {r.get('title','')} ({r.get('source','')} · {r.get('date','')})")
+            lines.append(f"링크: {r.get('link','')}")
+            lines.append("━━━━━━━━━━━━━━━")
+
+    return "\n".join(lines[:-1] if lines and lines[-1] == "━━━━━━━━━━━━━━━" else lines)
+
+
 def build_news_digest_message(today: str, now_time: str, keywords: list[str], items: list[dict[str, str]]) -> str:
     lines = [f"📰 키워드 뉴스 요약 ({today} {now_time})", f"🔎 키워드: {', '.join(keywords)}", "━━━━━━━━━━━━━━━"]
     for i, it in enumerate(items, start=1):
@@ -1993,6 +2208,17 @@ def run_daily_report(
             naver_client_id,
             naver_client_secret,
         )
+
+        # 네이버 경제분석 리포트 요약 (일 1회)
+        if state.get("economy_report_date") != today:
+            try:
+                reports = fetch_naver_economy_reports(limit=10)
+                if reports:
+                    tg.send_text(chat_id, build_economy_report_digest_message(today, now_time, reports))
+                    state["economy_report_date"] = today
+                    save_state(conn, chat_id, state)
+            except Exception as e:
+                LOG.warning("economy report digest failed chat_id=%s err=%s", chat_id, e)
 
 
 def run_morning_card(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: list[str]):
