@@ -1,4 +1,4 @@
-﻿# 0) 공통 변수(각 작업 스크립트 상단에 같이 넣어도 됨)
+# 0) 공통 변수(각 작업 스크립트 상단에 같이 넣어도 됨)
 # BOT_TOKEN: 텔레그램 봇 토큰
 # WEB_BASE_URL: 리포트/관리 웹 URL (예: https://your-nas-host:18080)
 # NAVER_CLIENT_ID / NAVER_CLIENT_SECRET: 네이버 검색 API 키 (데일리 리포트 뉴스요약용)
