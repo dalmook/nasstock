@@ -4,6 +4,7 @@ import re
 import sqlite3
 import io
 import time
+import secrets
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -18,12 +19,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 DB_PATH = os.getenv("DB_PATH", "/data/stock_prices.db")
 SYMBOLS_FILE = os.getenv("SYMBOLS_FILE", "/app/chat-configs.js")
 SEED_USERS_JSON = os.getenv("CHAT_USERS_JSON", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,19}$")
 NAME_RE = re.compile(r"^[가-힣a-zA-Z0-9_.\-]{2,32}$")
 
 app = FastAPI(title="nas-stock-web", version="2.0.0")
 _KRX_CACHE: dict[str, Any] = {"ts": 0.0, "items": []}
+_NAVER_STOCK_CACHE: dict[str, Any] = {"ts": 0.0, "items": []}
 
 
 def db_conn() -> sqlite3.Connection:
@@ -65,6 +70,20 @@ def ensure_schema(conn: sqlite3.Connection):
             report_token TEXT PRIMARY KEY,
             html_content TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_registrations (
+            name TEXT PRIMARY KEY,
+            pin TEXT NOT NULL,
+            status TEXT NOT NULL,
+            chat_id TEXT,
+            request_token TEXT NOT NULL,
+            requested_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            approved_by TEXT
         )
         """
     )
@@ -152,6 +171,65 @@ def delete_user(conn: sqlite3.Connection, name: str):
     with conn:
         conn.execute("DELETE FROM manage_users WHERE name = ?", (normalize_name(name),))
 
+
+def link_pending_registration_by_token(conn: sqlite3.Connection, token: str, chat_id: str) -> dict[str, Any] | None:
+    t = str(token or "").strip()
+    cid = str(chat_id or "").strip()
+    if not t or not cid or not cid.lstrip("-").isdigit():
+        return None
+    row = conn.execute(
+        "SELECT name, status FROM pending_registrations WHERE request_token = ?",
+        (t,),
+    ).fetchone()
+    if not row:
+        return None
+    now = now_utc_iso()
+    with conn:
+        conn.execute(
+            "UPDATE pending_registrations SET status='linked', chat_id=?, updated_at_utc=? WHERE request_token=?",
+            (cid, now, t),
+        )
+    return {"name": str(row["name"]), "status": str(row["status"])}
+
+
+def send_telegram_message(chat_id: str, text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    req = UrlRequest(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data=urlencode({"chat_id": chat_id, "text": text}).encode("utf-8"),
+        method="POST",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            payload = resp.read().decode("utf-8", errors="ignore")
+        obj = json.loads(payload)
+        return bool(obj.get("ok"))
+    except Exception:
+        return False
+
+
+def create_pending_registration(conn: sqlite3.Connection, name: str, pin: str) -> str:
+    now = now_utc_iso()
+    token = secrets.token_urlsafe(18)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO pending_registrations(name, pin, status, chat_id, request_token, requested_at_utc, updated_at_utc, approved_by)
+            VALUES (?, ?, 'requested', NULL, ?, ?, ?, NULL)
+            ON CONFLICT(name) DO UPDATE SET
+              pin=excluded.pin,
+              status='requested',
+              chat_id=NULL,
+              request_token=excluded.request_token,
+              requested_at_utc=excluded.requested_at_utc,
+              updated_at_utc=excluded.updated_at_utc,
+              approved_by=NULL
+            """,
+            (name, pin, token, now, now),
+        )
+    return token
 
 def js_object_to_json_text(js: str) -> str:
     body = re.sub(r"//.*", "", js)
@@ -291,13 +369,51 @@ def load_krx_listing_cache() -> list[dict[str, str]]:
         return cached if isinstance(cached, list) else []
 
 
+def load_naver_listing_cache() -> list[dict[str, str]]:
+    now = time.time()
+    cached = _NAVER_STOCK_CACHE.get("items")
+    if isinstance(cached, list) and cached and (now - float(_NAVER_STOCK_CACHE.get("ts") or 0.0) < 6 * 3600):
+        return cached
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    try:
+        for sosok, suffix, market in [("0", ".KS", "KOSPI"), ("1", ".KQ", "KOSDAQ")]:
+            for page in range(1, 70):
+                url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+                req = UrlRequest(url, headers={"user-agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=15) as resp:
+                    html = resp.read().decode("euc-kr", errors="ignore")
+                pairs = re.findall(r'/item/main\.naver\?code=(\d{6})[^>]*>([^<]+)</a>', html)
+                if not pairs:
+                    break
+                added = 0
+                for code, raw_name in pairs:
+                    sym = sanitize_symbol(f"{code}{suffix}")
+                    if not sym or sym in seen:
+                        continue
+                    name = sanitize_ticker_name(raw_name.strip(), sym)
+                    rows.append({"symbol": sym, "name": name, "market": market})
+                    seen.add(sym)
+                    added += 1
+                if added == 0 and page > 3:
+                    break
+        _NAVER_STOCK_CACHE["ts"] = now
+        _NAVER_STOCK_CACHE["items"] = rows
+        return rows
+    except Exception:
+        return cached if isinstance(cached, list) else []
+
+
 def krx_search_tickers(query: str, limit: int = 12) -> list[dict[str, Any]]:
     q = str(query or "").strip()
     if not q:
         return []
     q_lower = q.lower()
     out: list[dict[str, Any]] = []
-    for it in load_krx_listing_cache():
+    source_items = load_krx_listing_cache()
+    if not source_items:
+        source_items = load_naver_listing_cache()
+    for it in source_items:
         sym = str(it.get("symbol", "")).upper()
         name = str(it.get("name", ""))
         code = sym.split(".", 1)[0]
@@ -410,26 +526,41 @@ button{{background:#0f172a;color:#fff;border:0;padding:10px 14px;border-radius:1
 """
 
 
-def render_login_page(msg: str = "") -> str:
+def render_login_page(msg: str = "", action_link: str = "") -> str:
     note = f"<p class='msg err'>{escape(msg)}</p>" if msg else ""
+    action_link_html = (
+        f"<p style='margin-top:10px'><a href='{escape(action_link)}' target='_blank' rel='noopener noreferrer'>텔레그램 봇 열기</a></p>"
+        if action_link
+        else ""
+    )
     return f"""
 <!doctype html><html><head><meta charset='utf-8'><title>내 종목 관리</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
 <style>
 body{{font-family:Segoe UI,Apple SD Gothic Neo,Malgun Gothic,sans-serif;background:#f3f6fb;color:#0f172a;margin:0}}
-.wrap{{max-width:720px;margin:40px auto;padding:0 16px}}
+.wrap{{max-width:720px;margin:24px auto;padding:0 14px}}
 .panel{{background:#fff;border:1px solid #dbe3ef;border-radius:14px;padding:18px}}
 label{{font-size:13px;color:#475569}}
-input{{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px;margin-top:6px}}
-button{{background:#0f172a;color:#fff;border:0;padding:10px 14px;border-radius:10px;cursor:pointer}}
+input{{width:100%;padding:11px;border:1px solid #cbd5e1;border-radius:10px;margin-top:6px}}
+button{{background:#0f172a;color:#fff;border:0;padding:11px 14px;border-radius:10px;cursor:pointer;width:100%}}
 .msg.err{{color:#b91c1c}}
+.mini{{font-size:12px;color:#64748b}}
+@media (max-width:700px){{.wrap{{margin:12px auto}} .panel{{padding:14px}}}}
 </style></head>
 <body><div class='wrap'><div class='panel'>
 <h2>내 종목 관리 로그인</h2>
 {note}
+{action_link_html}
 <form method='get' action='/manage'>
 <label>이름</label><input name='name' required/><br/><br/>
 <label>PIN</label><input name='pin' type='password' required/><br/><br/>
 <button type='submit'>로그인</button>
+</form>
+<p class='mini' style='margin-top:14px'>처음 사용자라면 아래 회원가입을 사용하세요.</p>
+<form method='post' action='/manage/signup' style='display:grid;gap:8px;margin-top:8px'>
+<label>회원가입용 이름</label><input name='name' required/>
+<label>회원가입용 PIN</label><input name='pin' type='password' required/>
+<button type='submit'>회원가입 + 텔레그램 등록 요청</button>
 </form>
 </div></div></body></html>
 """
@@ -440,7 +571,7 @@ def redirect_manage(name: str, pin: str, msg: str) -> RedirectResponse:
     return RedirectResponse(url=f"/manage?{q}", status_code=303)
 
 
-def render_manage_page(name: str, pin: str, user_row: sqlite3.Row, cfg: dict[str, Any], users: list[sqlite3.Row], msg: str = "") -> str:
+def render_manage_page(name: str, pin: str, user_row: sqlite3.Row, cfg: dict[str, Any], users: list[sqlite3.Row], pending_regs: list[sqlite3.Row], msg: str = "") -> str:
     chat_id = str(user_row["chat_id"])
     is_admin = int(user_row["is_admin"] or 0) == 1
 
@@ -484,6 +615,7 @@ def render_manage_page(name: str, pin: str, user_row: sqlite3.Row, cfg: dict[str
         )
 
     users_html = ""
+    pending_rows = '<tr><td colspan="4">없음</td></tr>'
     if is_admin:
         urows = []
         for u in users:
@@ -496,6 +628,22 @@ def render_manage_page(name: str, pin: str, user_row: sqlite3.Row, cfg: dict[str
                 f"<input type='hidden' name='target_name' value='{escape(uname)}'/><button type='submit'>삭제</button></form></td>"
                 "</tr>"
             )
+        pending_items = []
+        for pr in pending_regs:
+            pname = str(pr['name'])
+            pchat = str(pr['chat_id'] or '-')
+            pstatus = str(pr['status'])
+            pending_items.append(
+                "<tr>"
+                f"<td>{escape(pname)}</td><td>{escape(pchat)}</td><td>{escape(pstatus)}</td>"
+                f"<td><form method='post' action='/manage/admin/approve_signup'>"
+                f"<input type='hidden' name='name' value='{escape(name)}'/><input type='hidden' name='pin' value='{escape(pin)}'/>"
+                f"<input type='hidden' name='target_name' value='{escape(pname)}'/>"
+                "<button type='submit'>승인</button></form></td>"
+                "</tr>"
+            )
+        if pending_items:
+            pending_rows = ''.join(pending_items)
         users_html = f"""
 <div class='panel'>
 <h3>알림 대상(사용자) 관리</h3>
@@ -514,8 +662,14 @@ def render_manage_page(name: str, pin: str, user_row: sqlite3.Row, cfg: dict[str
 <div class='table-wrap'>
 <table>
 <tr><th>name</th><th>chat_id</th><th>enabled</th><th>admin</th><th>action</th></tr>
-{''.join(urows) if urows else '<tr><td colspan="5">없음</td></tr>'}
+{''.join(urows) if urows else "<tr><td colspan='5'>없음</td></tr>"}
 </table>
+</div>
+</div>
+<div class='panel'>
+<h3>가입 승인 대기</h3>
+<div class='table-wrap'>
+<table><tr><th>name</th><th>chat_id</th><th>status</th><th>action</th></tr>{pending_rows}</table>
 </div>
 </div>
 """
@@ -603,6 +757,7 @@ details summary{{cursor:pointer;font-weight:600;color:#334155}}
   </form>
 </div>
 {msg_html}
+<div class='panel mobile-only'><h3>회원가입</h3><p class='mini'>로그아웃 상태에서 회원가입 가능하며, 관리자 승인 후 활성화됩니다.</p></div>
 <div class='grid'>
 <div>
 <div class='panel'>
@@ -636,7 +791,7 @@ details summary{{cursor:pointer;font-weight:600;color:#334155}}
     <div class='table-wrap' style='margin-top:10px'>
       <table>
       <tr><th>심볼</th><th>이름</th><th>drop rule</th><th>액션</th></tr>
-      {''.join(rows) if rows else '<tr><td colspan=\"4\">없음</td></tr>'}
+      {''.join(rows) if rows else "<tr><td colspan='4'>없음</td></tr>"}
       </table>
     </div>
   </details>
@@ -739,7 +894,8 @@ def manage(name: str | None = Query(default=None), pin: str | None = Query(defau
         ov = load_override(conn, str(user["chat_id"]))
         cfg = merged_chat_config(base, ov, str(user["chat_id"]))
         users = conn.execute("SELECT name, chat_id, is_admin, enabled FROM manage_users ORDER BY name").fetchall()
-        return render_manage_page(str(user["name"]), str(pin), user, cfg, users, msg=msg)
+        pending_regs = conn.execute("SELECT name, chat_id, status FROM pending_registrations WHERE status = 'linked' ORDER BY requested_at_utc").fetchall()
+        return render_manage_page(str(user["name"]), str(pin), user, cfg, users, pending_regs, msg=msg)
 
 
 @app.get("/api/search_tickers")
@@ -760,6 +916,69 @@ def manage_setup(name: str = Form(...), pin: str = Form(...), chat_id: str = For
             return RedirectResponse(url="/manage", status_code=303)
         upsert_user(conn, nm, str(pin).strip(), str(chat_id).strip(), 1, 1)
     return redirect_manage(nm, str(pin).strip(), "초기 관리자 생성 완료")
+
+
+@app.post("/manage/signup")
+def manage_signup(name: str = Form(...), pin: str = Form(...)):
+    nm = normalize_name(name)
+    pinv = str(pin).strip()
+    if not NAME_RE.fullmatch(nm):
+        return HTMLResponse(render_login_page("이름 형식 오류"), status_code=400)
+    if len(pinv) < 4:
+        return HTMLResponse(render_login_page("PIN은 4자리 이상"), status_code=400)
+    with db_conn() as conn:
+        exists = conn.execute("SELECT 1 FROM manage_users WHERE name = ?", (nm,)).fetchone()
+        if exists:
+            return HTMLResponse(render_login_page("이미 존재하는 이름입니다"), status_code=400)
+        token = create_pending_registration(conn, nm, pinv)
+
+    deep_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=reg_{token}" if TELEGRAM_BOT_USERNAME else ""
+    guide = "텔레그램 봇 설정이 없어 운영자에게 문의하세요."
+    if deep_link:
+        guide = "가입 요청 저장됨. 텔레그램 봇으로 이동해 시작 버튼을 누르세요(자동 연동)."
+        return HTMLResponse(render_login_page(guide, action_link=deep_link))
+    return HTMLResponse(render_login_page(f"가입 요청 저장됨. {guide}"))
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    if TELEGRAM_WEBHOOK_SECRET:
+        if request.headers.get("x-telegram-bot-api-secret-token", "") != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    payload = await request.json()
+    msg = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(msg, dict):
+        return JSONResponse({"ok": True})
+    txt = str(msg.get("text") or "").strip()
+    chat = msg.get("chat") if isinstance(msg.get("chat"), dict) else {}
+    chat_id = str(chat.get("id") or "").strip()
+    token = ""
+    if txt.startswith("/start "):
+        token = txt.split(" ", 1)[1].strip()
+    elif txt.startswith("reg_"):
+        token = txt.strip()
+    if token.startswith("reg_"):
+        token = token[4:]
+    if token and chat_id:
+        with db_conn() as conn:
+            linked = link_pending_registration_by_token(conn, token, chat_id)
+        if linked:
+            send_telegram_message(chat_id, "등록 요청이 접수되었습니다. 관리자 승인 후 알림이 활성화됩니다.")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/telegram/link")
+def telegram_link(token: str = Query(default=""), chat_id: str = Query(default="")):
+    t = str(token or "").strip()
+    cid = str(chat_id or "").strip()
+    if not t or not cid:
+        return JSONResponse({"ok": False, "error": "token/chat_id required"}, status_code=400)
+    with db_conn() as conn:
+        linked = link_pending_registration_by_token(conn, t, cid)
+    if not linked:
+        return JSONResponse({"ok": False, "error": "token not found"}, status_code=404)
+    send_telegram_message(cid, "등록 요청이 접수되었습니다. 관리자 승인 후 알림이 활성화됩니다.")
+    return JSONResponse({"ok": True, "chat_id": cid})
 
 
 @app.post("/manage/add")
@@ -877,6 +1096,28 @@ def manage_admin_add_user(
             1 if new_enabled else 0,
         )
     return redirect_manage(name, pin, f"사용자 {nm} 저장 완료")
+
+
+@app.post("/manage/admin/approve_signup")
+def manage_admin_approve_signup(name: str = Form(...), pin: str = Form(...), target_name: str = Form(...)):
+    with db_conn() as conn:
+        user = require_auth(conn, name, pin)
+        if int(user["is_admin"] or 0) != 1:
+            return redirect_manage(name, pin, "관리자 권한 필요")
+        tn = normalize_name(target_name)
+        row = conn.execute("SELECT name, pin, chat_id, status FROM pending_registrations WHERE name = ?", (tn,)).fetchone()
+        if not row:
+            return redirect_manage(name, pin, "승인 대상 없음")
+        if str(row["status"]) != "linked" or not str(row["chat_id"] or "").strip().isdigit():
+            return redirect_manage(name, pin, "텔레그램 연동 전입니다")
+        upsert_user(conn, tn, str(row["pin"]), str(row["chat_id"]), 0, 1)
+        with conn:
+            conn.execute(
+                "UPDATE pending_registrations SET status='approved', approved_by=?, updated_at_utc=? WHERE name = ?",
+                (str(user["name"]), now_utc_iso(), tn),
+            )
+    send_telegram_message(str(row["chat_id"]), "관리자 승인 완료: 알림 구독이 활성화되었습니다.")
+    return redirect_manage(name, pin, f"사용자 {tn} 승인 완료")
 
 
 @app.post("/manage/admin/delete_user")

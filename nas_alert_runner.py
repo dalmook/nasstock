@@ -2084,7 +2084,7 @@ def is_krx_market_hours_kst(now: dt.datetime) -> bool:
     return 9 * 60 <= minutes <= 15 * 60 + 30
 
 
-def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: list[str], period: int, pct: float):
+def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: list[str], period: int, pct: float, cfg: dict[str, Any]):
     now = now_kst()
     if not is_krx_market_hours_kst(now):
         return
@@ -2107,6 +2107,24 @@ def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: l
         if e:
             env_map[sym] = e
 
+    symbol_names: dict[str, str] = {}
+    dft = cfg.get("default") if isinstance(cfg.get("default"), dict) else {}
+    dft_tickers = dft.get("tickers") if isinstance(dft.get("tickers"), list) else []
+    for t in dft_tickers:
+        if isinstance(t, dict):
+            ss = str(t.get("symbol", "")).strip().upper()
+            nn = str(t.get("name", "")).strip()
+            if ss and nn:
+                symbol_names[ss] = nn
+    for chat_id in chat_ids:
+        chat_cfg = load_chat_config(cfg, chat_id)
+        for t in chat_cfg.get("tickers", []):
+            if isinstance(t, dict):
+                ss = str(t.get("symbol", "")).strip().upper()
+                nn = str(t.get("name", "")).strip()
+                if ss and nn and ss not in symbol_names:
+                    symbol_names[ss] = nn
+
     for chat_id in chat_ids:
         state = load_state(conn, chat_id)
         watch_state = state.get("envelope_watch", {}) if isinstance(state.get("envelope_watch"), dict) else {}
@@ -2126,7 +2144,7 @@ def run_envelope_watch(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: l
                 if side != "NONE":
                     title = "🟢 하단 터치" if side == "LOWER" else "🔴 상단 터치"
                     alerts.append(
-                        f"{title} {sym}\n현재가: {fmt_money(price, 'KRW')}\nEnvelope({period}, {pct*100:.1f}): 상단 {fmt_money(envp['upper'], 'KRW')} / 하단 {fmt_money(envp['lower'], 'KRW')}"
+                        f"{title} {symbol_names.get(sym, sym)} ({sym})\n현재가: {fmt_money(price, 'KRW')}\nEnvelope({period}, {pct*100:.1f}): 상단 {fmt_money(envp['upper'], 'KRW')} / 하단 {fmt_money(envp['lower'], 'KRW')}"
                     )
 
         if alerts:
@@ -2176,7 +2194,7 @@ def main():
         elif args.task == "morning_card":
             run_morning_card(conn, tg, chat_ids)
         elif args.task == "envelope_watch":
-            run_envelope_watch(conn, tg, chat_ids, max(2, int(args.envelope_period)), float(args.envelope_pct))
+            run_envelope_watch(conn, tg, chat_ids, max(2, int(args.envelope_period)), float(args.envelope_pct), cfg)
     finally:
         conn.close()
 
