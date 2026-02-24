@@ -85,7 +85,7 @@ def ensure_schema(conn: sqlite3.Connection):
             approved_by TEXT
         )
         """
-    )    
+    ) 
     conn.commit()
 
 
@@ -228,6 +228,7 @@ def create_pending_registration(conn: sqlite3.Connection, name: str, pin: str) -
             (name, pin, token, now, now),
         )
     return token
+
 
 def js_object_to_json_text(js: str) -> str:
     body = re.sub(r"//.*", "", js)
@@ -486,8 +487,13 @@ button{{background:#0f172a;color:#fff;border:0;padding:10px 14px;border-radius:1
 """
 
 
-def render_login_page(msg: str = "") -> str:
+def render_login_page(msg: str = "", action_link: str = "") -> str:
     note = f"<p class='msg err'>{escape(msg)}</p>" if msg else ""
+    action_link_html = (
+        f"<p style='margin-top:10px'><a href='{escape(action_link)}' target='_blank' rel='noopener noreferrer'>텔레그램 봇 열기</a></p>"
+        if action_link
+        else ""
+    )    
     return f"""
 <!doctype html><html><head><meta charset='utf-8'><title>내 종목 관리</title>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
@@ -505,6 +511,7 @@ button{{background:#0f172a;color:#fff;border:0;padding:11px 14px;border-radius:1
 <body><div class='wrap'><div class='panel'>
 <h2>내 종목 관리 로그인</h2>
 {note}
+{action_link_html}
 <form method='get' action='/manage'>
 <label>이름</label><input name='name' required/><br/><br/>
 <label>PIN</label><input name='pin' type='password' required/><br/><br/>
@@ -597,7 +604,7 @@ def render_manage_page(name: str, pin: str, user_row: sqlite3.Row, cfg: dict[str
                 "</tr>"
             )
         if pending_items:
-            pending_rows = ''.join(pending_items)            
+            pending_rows = ''.join(pending_items)          
         users_html = f"""
 <div class='panel'>
 <h3>알림 대상(사용자) 관리</h3>
@@ -851,7 +858,6 @@ def manage(name: str | None = Query(default=None), pin: str | None = Query(defau
         pending_regs = conn.execute("SELECT name, chat_id, status FROM pending_registrations WHERE status = 'linked' ORDER BY requested_at_utc").fetchall()
         return render_manage_page(str(user["name"]), str(pin), user, cfg, users, pending_regs, msg=msg)
 
-
 @app.get("/api/search_tickers")
 def api_search_tickers(q: str = Query(default=""), limit: int = Query(default=12)):
     items = yahoo_search_tickers(q, limit=limit)
@@ -888,7 +894,8 @@ def manage_signup(name: str = Form(...), pin: str = Form(...)):
     deep_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=reg_{token}" if TELEGRAM_BOT_USERNAME else ""
     guide = "텔레그램 봇 설정이 없어 운영자에게 문의하세요."
     if deep_link:
-        guide = f"텔레그램 봇으로 이동해 시작 버튼을 누르세요(자동 연동): <a href='{escape(deep_link)}' target='_blank'>{escape(deep_link)}</a>"
+        guide = "가입 요청 저장됨. 텔레그램 봇으로 이동해 시작 버튼을 누르세요(자동 연동)."
+        return HTMLResponse(render_login_page(guide, action_link=deep_link))
     return HTMLResponse(render_login_page(f"가입 요청 저장됨. {guide}"))
 
 
@@ -931,8 +938,6 @@ def telegram_link(token: str = Query(default=""), chat_id: str = Query(default="
         return JSONResponse({"ok": False, "error": "token not found"}, status_code=404)
     send_telegram_message(cid, "등록 요청이 접수되었습니다. 관리자 승인 후 알림이 활성화됩니다.")
     return JSONResponse({"ok": True, "chat_id": cid})
-
-
 
 @app.post("/manage/add")
 def manage_add(name: str = Form(...), pin: str = Form(...), symbol: str = Form(...), ticker_name: str = Form(default="")):
@@ -1071,7 +1076,7 @@ def manage_admin_approve_signup(name: str = Form(...), pin: str = Form(...), tar
     send_telegram_message(str(row["chat_id"]), "관리자 승인 완료: 알림 구독이 활성화되었습니다.")
     return redirect_manage(name, pin, f"사용자 {tn} 승인 완료")
 
-    
+
 
 @app.post("/manage/admin/delete_user")
 def manage_admin_delete_user(name: str = Form(...), pin: str = Form(...), target_name: str = Form(...)):
@@ -1096,4 +1101,5 @@ def report(token: str, request: Request):
     if not row:
         raise HTTPException(status_code=404, detail="report not found")
     return row["html_content"]
+
 
