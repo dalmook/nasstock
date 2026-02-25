@@ -1212,7 +1212,7 @@ def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any],
 <div style='max-width:780px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:18px;'>
 <div style='font-size:13px;color:#6b7280;'>📘 Economy Report Brief</div>
 <div style='font-size:26px;font-weight:900;margin-top:6px;'>{escape(today)} {escape(now_time)} KST</div>
-<div style='font-size:13px;color:#6b7280;margin-top:4px;'>생성시각: 15시 이후 1회 · 발송시각: 16시 이후 1회</div>
+<div style='font-size:13px;color:#6b7280;margin-top:4px;'>생성시각: 13시 이후 1회 · 발송시각: 14시 이후 1회</div>
 <div style='margin-top:14px;padding:12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;line-height:1.7;'>{overview or '요약 없음'}</div>
 <div style='margin-top:14px;font-weight:900;'>리포트 목록 (최대 10개)</div>
 <ul style='line-height:1.7;padding-left:18px;'>{''.join(lis)}</ul>
