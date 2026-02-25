@@ -87,6 +87,19 @@ def ensure_schema(conn: sqlite3.Connection):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticker_master (
+            symbol TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            market TEXT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ticker_master_name ON ticker_master(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ticker_master_market ON ticker_master(market)")
     conn.commit()
 
 
@@ -423,6 +436,76 @@ def krx_search_tickers(query: str, limit: int = 12) -> list[dict[str, Any]]:
         if len(out) >= max(1, min(int(limit), 20)):
             break
     return out
+
+
+def refresh_ticker_master(conn: sqlite3.Connection, force_refresh: bool = False) -> dict[str, Any]:
+    if force_refresh:
+        _KRX_CACHE["ts"] = 0.0
+        _KRX_CACHE["items"] = []
+        _NAVER_STOCK_CACHE["ts"] = 0.0
+        _NAVER_STOCK_CACHE["items"] = []
+
+    source = "KRX"
+    source_items = load_krx_listing_cache()
+    if not source_items:
+        source = "NAVER"
+        source_items = load_naver_listing_cache()
+
+    now = now_utc_iso()
+    rows: list[tuple[str, str, str, str, str]] = []
+    for it in source_items:
+        sym = sanitize_symbol(it.get("symbol", ""))
+        if not sym:
+            continue
+        name = sanitize_ticker_name(it.get("name") or sym, sym)
+        market = str(it.get("market") or "KRX").strip()[:20] or "KRX"
+        rows.append((sym, name, market, source, now))
+
+    with conn:
+        conn.execute("DELETE FROM ticker_master")
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO ticker_master(symbol, name, market, source, updated_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    return {"source": source, "count": len(rows), "updated_at_utc": now}
+
+
+def search_ticker_master(conn: sqlite3.Connection, query: str, limit: int = 12) -> list[dict[str, Any]]:
+    q = str(query or "").strip()
+    if not q:
+        return []
+    max_count = max(1, min(20, int(limit)))
+    q_upper = q.upper()
+    q_lower = q.lower()
+    q_symbol_prefix = f"{q_upper}%"
+    q_name_contains = f"%{q}%"
+    q_symbol_contains = f"%{q_upper}%"
+
+    rows = conn.execute(
+        """
+        SELECT symbol, name, market
+        FROM ticker_master
+        WHERE name LIKE ?
+           OR symbol LIKE ?
+           OR symbol LIKE ?
+        ORDER BY
+          CASE
+            WHEN symbol = ? THEN 0
+            WHEN symbol LIKE ? THEN 1
+            WHEN lower(name) LIKE ? THEN 2
+            ELSE 3
+          END,
+          symbol ASC
+        LIMIT ?
+        """,
+        (q_name_contains, q_symbol_contains, q_symbol_prefix, q_upper, q_symbol_prefix, f"{q_lower}%", max_count),
+    ).fetchall()
+    return [{"symbol": str(r["symbol"]), "name": str(r["name"]), "type": str(r["market"])} for r in rows]
 
 
 def yahoo_search_tickers(query: str, limit: int = 12) -> list[dict[str, Any]]:
@@ -900,7 +983,11 @@ def manage(name: str | None = Query(default=None), pin: str | None = Query(defau
 
 @app.get("/api/search_tickers")
 def api_search_tickers(q: str = Query(default=""), limit: int = Query(default=12)):
-    items = yahoo_search_tickers(q, limit=limit)
+    with db_conn() as conn:
+        ensure_schema(conn)
+        items = search_ticker_master(conn, q, limit=limit)
+    if not items:
+        items = yahoo_search_tickers(q, limit=limit)
     return JSONResponse({"ok": True, "items": items})
 
 
