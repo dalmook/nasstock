@@ -40,8 +40,11 @@
 /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/ingest_prices.py --mode daily --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --daily-period-days 420 --lookback-days 60
 
 # 1-1) 종목 마스터 업데이트 (매일 07:42)
+<<<<<<< codex/investigate-search-logic-in-manage-screen-60yt55
 #   별도 환경변수 추가는 필요 없습니다(--db-path 사용).
 #   단, 해당 파일을 이미지에 포함하려면 코드 변경 후 docker build 재실행이 필수입니다.
+=======
+>>>>>>> main
 /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data stock-price-ingest:latest python /app/refresh_ticker_master.py --db-path /data/stock_prices.db --force
 
 # 2) 준실시간 적재 (평일 09:00~23:30, 30분 간격)
