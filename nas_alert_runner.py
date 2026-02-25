@@ -1988,6 +1988,7 @@ def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any
             {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
         ],
         "text": {"format": {"type": "json_object"}},
+        "truncation": "auto",
         "max_output_tokens": 1800,
     }
     try:
