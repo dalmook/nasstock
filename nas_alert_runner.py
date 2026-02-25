@@ -620,6 +620,8 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
         LOG.info("openai market_brief skipped: missing OPENAI_API_KEY")
         return None
 
+    model = (os.getenv("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+
     system_prompt = (
         "한국어 금융 브리프 편집자. 기사 본문 금지. 입력 헤드라인/설명/지표만 사용. "
         "중복 제거·압축하고 JSON만 출력. 카테고리 혼입 금지."
@@ -655,13 +657,14 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
     }
 
     req_body = {
-        "model": "gpt-5-mini",
+        "model": model,
         "reasoning": {"effort": "low"},
         "input": [
-            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)}]},
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)}]},
         ],
         "text": {"format": {"type": "json_object"}},
+        "truncation": "auto",
         "max_output_tokens": 2200,
     }
 
@@ -669,8 +672,9 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
     for attempt in range(4):
         try:
             LOG.info(
-                "openai market_brief call attempt=%s headlines=%s indicators=%s max_output_tokens=%s",
+                "openai market_brief call attempt=%s model=%s headlines=%s indicators=%s max_output_tokens=%s",
                 attempt + 1,
+                model,
                 sum(len(v) for v in headlines_payload.values()) if isinstance(headlines_payload, dict) else 0,
                 len(indicators_payload) if isinstance(indicators_payload, list) else 0,
                 req_body.get("max_output_tokens"),
@@ -686,18 +690,41 @@ def openai_market_brief_json(headlines_payload: dict[str, Any], indicators_paylo
             )
             with urlopen(req, timeout=70) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
+
             obj = json.loads(raw)
             _log_openai_usage("market_brief", obj)
+
             txt = _openai_extract_json_text(obj).strip()
             if not txt:
                 raise RuntimeError("empty OpenAI JSON text")
+
             parsed = json.loads(txt)
             return parsed if isinstance(parsed, dict) else None
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
+
+        except HTTPError as e:
             last_err = e
-            sleep_s = min(8.0, (2**attempt) + 0.3)
-            time.sleep(sleep_s)
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            LOG.warning(
+                "openai market_brief HTTPError attempt=%s status=%s detail=%s",
+                attempt + 1,
+                getattr(e, "code", "?"),
+                (detail or str(e))[:1200],
+            )
+            if getattr(e, "code", 0) in (400, 401, 403, 404):
+                break
+            time.sleep(min(8.0, (2**attempt) + 0.3))
             continue
+
+        except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
+            last_err = e
+            LOG.warning("openai market_brief error attempt=%s err=%s", attempt + 1, e)
+            time.sleep(min(8.0, (2**attempt) + 0.3))
+            continue
+
     if last_err:
         LOG.warning("openai market brief failed: %s", last_err)
     return None
@@ -1247,6 +1274,8 @@ def openai_candidate_brief_json(
     if not buy_candidates and not sell_candidates:
         return {"summary": "", "buy": [], "sell": []}
 
+    model = (os.getenv("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+
     market_compact = []
     for r in market_rows:
         sym = str(r.get("symbol", ""))
@@ -1279,14 +1308,16 @@ def openai_candidate_brief_json(
             "입력에 없는 정보 추정 최소화",
         ],
     }
+
     req_body = {
-        "model": "gpt-5-mini",
+        "model": model,
         "reasoning": {"effort": "low"},
         "input": [
-            {"role": "system", "content": [{"type": "text", "text": "주식 데일리 브리퍼. 입력 지표와 시황만 사용. JSON만 출력."}]},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]},
+            {"role": "system", "content": [{"type": "input_text", "text": "주식 데일리 브리퍼. 입력 지표와 시황만 사용. JSON만 출력."}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
         ],
         "text": {"format": {"type": "json_object"}},
+        "truncation": "auto",
         "max_output_tokens": 1600,
     }
 
@@ -1294,8 +1325,9 @@ def openai_candidate_brief_json(
     for attempt in range(3):
         try:
             LOG.info(
-                "openai candidate_brief call attempt=%s buy_candidates=%s sell_candidates=%s max_output_tokens=%s",
+                "openai candidate_brief call attempt=%s model=%s buy_candidates=%s sell_candidates=%s max_output_tokens=%s",
                 attempt + 1,
+                model,
                 len(buy_candidates),
                 len(sell_candidates),
                 req_body.get("max_output_tokens"),
@@ -1308,14 +1340,41 @@ def openai_candidate_brief_json(
             )
             with urlopen(req, timeout=60) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
+
             obj = json.loads(raw)
             _log_openai_usage("candidate_brief", obj)
+
             txt = _openai_extract_json_text(obj).strip()
+            if not txt:
+                raise RuntimeError("empty OpenAI JSON text")
+
             parsed = json.loads(txt)
             return parsed if isinstance(parsed, dict) else None
-        except Exception as e:
+
+        except HTTPError as e:
             last_err = e
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            LOG.warning(
+                "openai candidate_brief HTTPError attempt=%s status=%s detail=%s",
+                attempt + 1,
+                getattr(e, "code", "?"),
+                (detail or str(e))[:1200],
+            )
+            if getattr(e, "code", 0) in (400, 401, 403, 404):
+                break
             time.sleep(min(6.0, (2**attempt) + 0.2))
+            continue
+
+        except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError) as e:
+            last_err = e
+            LOG.warning("openai candidate_brief error attempt=%s err=%s", attempt + 1, e)
+            time.sleep(min(6.0, (2**attempt) + 0.2))
+            continue
+
     if last_err:
         LOG.warning("openai candidate brief failed: %s", last_err)
     return None
