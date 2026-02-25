@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY ingest_prices.py /app/ingest_prices.py
 COPY nas_alert_runner.py /app/nas_alert_runner.py
 COPY nas_web_app.py /app/nas_web_app.py
+COPY refresh_ticker_master.py /app/refresh_ticker_master.py
 COPY chat-configs.js /app/chat-configs.js
 
 CMD ["python", "/app/ingest_prices.py", "--mode", "daily", "--db-path", "/data/stock_prices.db", "--symbols-file", "/app/chat-configs.js"]
