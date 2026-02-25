@@ -39,13 +39,21 @@
 # 1) 일봉 + 지표 적재 (매일 07:40)
 /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/ingest_prices.py --mode daily --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --daily-period-days 420 --lookback-days 60
 
+# 1-1) 종목 마스터 업데이트 (매일 07:42)
+#   별도 환경변수 추가는 필요 없습니다(--db-path 사용).
+#   단, 해당 파일을 이미지에 포함하려면 코드 변경 후 docker build 재실행이 필수입니다.
+/usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data stock-price-ingest:latest python /app/refresh_ticker_master.py --db-path /data/stock_prices.db --force
+
 # 2) 준실시간 적재 (평일 09:00~23:30, 30분 간격)
 /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/ingest_prices.py --mode intraday --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --intraday-period 10d --intraday-interval 30m
 
 # 3) 모닝 카드 전송 (매일 07:45)
 BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'; /usr/local/bin/docker run --rm -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/nas_alert_runner.py --task morning_card --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --telegram-token "$BOT_TOKEN"
 
-# 4) 데일리 리포트 전송 + 공통 마켓 브리프 생성/버튼 전송 (매일 07:50)
+# 4-1) 경제분석 리포트 업데이트(생성만, 미발송) (매일 13:00)
+BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'; WEB_BASE_URL='https://your-nas-host:18080'; NAVER_CLIENT_ID='YOUR_NAVER_CLIENT_ID'; NAVER_CLIENT_SECRET='YOUR_NAVER_CLIENT_SECRET'; OPENAI_API_KEY='YOUR_OPENAI_API_KEY'; /usr/local/bin/docker run --rm -e NAVER_CLIENT_ID="$NAVER_CLIENT_ID" -e NAVER_CLIENT_SECRET="$NAVER_CLIENT_SECRET" -e OPENAI_API_KEY="$OPENAI_API_KEY" -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/nas_alert_runner.py --task daily_report --prepare-economy-only --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --telegram-token "$BOT_TOKEN" --web-base-url "$WEB_BASE_URL"
+
+# 4-2) 데일리 리포트 전송 + 경제분석 리포트 발송 (매일 14:00)
 BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'; WEB_BASE_URL='https://your-nas-host:18080'; NAVER_CLIENT_ID='YOUR_NAVER_CLIENT_ID'; NAVER_CLIENT_SECRET='YOUR_NAVER_CLIENT_SECRET'; OPENAI_API_KEY='YOUR_OPENAI_API_KEY'; /usr/local/bin/docker run --rm -e NAVER_CLIENT_ID="$NAVER_CLIENT_ID" -e NAVER_CLIENT_SECRET="$NAVER_CLIENT_SECRET" -e OPENAI_API_KEY="$OPENAI_API_KEY" -v /volume1/docker/stock_alert/data:/data -v /volume1/docker/stock_alert/chat-configs.js:/app/chat-configs.js:ro stock-price-ingest:latest python /app/nas_alert_runner.py --task daily_report --db-path /data/stock_prices.db --symbols-file /app/chat-configs.js --telegram-token "$BOT_TOKEN" --web-base-url "$WEB_BASE_URL"
 
 # 5) Envelope 감시 (평일 09:00~15:30, 10분 간격)
