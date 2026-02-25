@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import datetime as dt
 import io
 import json
@@ -1984,8 +1984,8 @@ def openai_economy_report_digest(reports: list[dict[str, str]]) -> dict[str, Any
         "model": "gpt-5-mini",
         "reasoning": {"effort": "low"},
         "input": [
-            {"role": "system", "content": [{"type": "text", "text": "거시경제 리서치 튜터. PDF 발췌문 중심으로 학습용 요약을 만들고 JSON만 출력."}]},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]},
+            {"role": "system", "content": [{"type": "input_text", "text": "거시경제 리서치 튜터. PDF 발췌문 중심으로 학습용 요약을 만들고 JSON만 출력."}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
         ],
         "text": {"format": {"type": "json_object"}},
         "max_output_tokens": 1800,
