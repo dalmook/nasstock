@@ -174,6 +174,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--envelope-period", type=int, default=20)
     p.add_argument("--envelope-pct", type=float, default=0.2)
     p.add_argument("--obs-log-enabled", action="store_true")
+    p.add_argument("--prepare-economy-only", action="store_true", help="Prepare economy brief only (no telegram send)")
     return p.parse_args()
 
 
@@ -2280,6 +2281,7 @@ def run_daily_report(
     web_base_url: str,
     naver_client_id: str = "",
     naver_client_secret: str = "",
+    prepare_economy_only: bool = False,
 ):
     now = now_kst()
     today = fmt_date_kst(now)
@@ -2305,8 +2307,11 @@ def run_daily_report(
             naver_client_id,
             naver_client_secret,
         )
-        if minute_now >= 15 * 60:
+        if minute_now >= 13 * 60:
             economy_brief_token = get_or_create_economy_brief_report(conn, today, now_time)
+
+    if prepare_economy_only:
+        return
 
     chat_cfgs = {}
     for cid in chat_ids:
@@ -2604,7 +2609,7 @@ def run_daily_report(
         else:
             tg.send_text(chat_id, short_msg)
 
-        if minute_now >= 16 * 60 and economy_brief_url and state.get("economy_brief_sent_date") != today:
+        if minute_now >= 14 * 60 and economy_brief_url and state.get("economy_brief_sent_date") != today:
             tg.send_text_with_buttons(
                 chat_id,
                 f"📘 경제분석 리포트 ({today} {now_time})\n오늘자 리포트가 준비됐어요. 아래 버튼으로 확인하세요.",
@@ -2829,6 +2834,7 @@ def main():
                 web_base,
                 (os.getenv("NAVER_CLIENT_ID", "") or "").strip(),
                 (os.getenv("NAVER_CLIENT_SECRET", "") or "").strip(),
+                prepare_economy_only=bool(args.prepare_economy_only),
             )
         elif args.task == "morning_card":
             run_morning_card(conn, tg, chat_ids)
