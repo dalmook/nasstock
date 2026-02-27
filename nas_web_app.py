@@ -22,6 +22,7 @@ SEED_USERS_JSON = os.getenv("CHAT_USERS_JSON", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+TEST_CHAT_ID = "6474744493"
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,19}$")
 NAME_RE = re.compile(r"^[가-힣a-zA-Z0-9_.\-]{2,32}$")
@@ -185,24 +186,37 @@ def delete_user(conn: sqlite3.Connection, name: str):
         conn.execute("DELETE FROM manage_users WHERE name = ?", (normalize_name(name),))
 
 
+def find_user_by_chat_id(conn: sqlite3.Connection, chat_id: str) -> sqlite3.Row | None:
+    cid = str(chat_id or "").strip()
+    if not cid:
+        return None
+    return conn.execute(
+        "SELECT name, chat_id, enabled FROM manage_users WHERE chat_id = ? LIMIT 1",
+        (cid,),
+    ).fetchone()
+
+
 def link_pending_registration_by_token(conn: sqlite3.Connection, token: str, chat_id: str) -> dict[str, Any] | None:
     t = str(token or "").strip()
     cid = str(chat_id or "").strip()
     if not t or not cid or not cid.lstrip("-").isdigit():
         return None
     row = conn.execute(
-        "SELECT name, status FROM pending_registrations WHERE request_token = ?",
+        "SELECT name, status, chat_id FROM pending_registrations WHERE request_token = ?",
         (t,),
     ).fetchone()
     if not row:
         return None
+    owner = find_user_by_chat_id(conn, cid)
+    if owner and normalize_name(str(owner["name"])) != normalize_name(str(row["name"])):
+        return {"ok": False, "error": "duplicate_chat_id", "chat_id": cid, "owner_name": str(owner["name"])}
     now = now_utc_iso()
     with conn:
         conn.execute(
             "UPDATE pending_registrations SET status='linked', chat_id=?, updated_at_utc=? WHERE request_token=?",
             (cid, now, t),
         )
-    return {"name": str(row["name"]), "status": str(row["status"])}
+    return {"ok": True, "name": str(row["name"]), "status": str(row["status"])}
 
 
 def send_telegram_message(chat_id: str, text: str) -> bool:
@@ -221,6 +235,19 @@ def send_telegram_message(chat_id: str, text: str) -> bool:
         return bool(obj.get("ok"))
     except Exception:
         return False
+
+
+def notify_admin_signup_request(name: str, chat_id: str) -> bool:
+    admin_chat_id = str(TEST_CHAT_ID).strip()
+    if not admin_chat_id:
+        return False
+    text = (
+        "신규회원등록 요청\n"
+        f"- 이름: {name}\n"
+        f"- chat_id: {chat_id}\n"
+        "- 상태: 텔레그램 시작 완료 (승인 대기)"
+    )
+    return send_telegram_message(admin_chat_id, text)
 
 
 def create_pending_registration(conn: sqlite3.Connection, name: str, pin: str) -> str:
@@ -609,44 +636,348 @@ button{{background:#0f172a;color:#fff;border:0;padding:10px 14px;border-radius:1
 """
 
 
-def render_login_page(msg: str = "", action_link: str = "") -> str:
-    note = f"<p class='msg err'>{escape(msg)}</p>" if msg else ""
-    action_link_html = (
-        f"<p style='margin-top:10px'><a href='{escape(action_link)}' target='_blank' rel='noopener noreferrer'>텔레그램 봇 열기</a></p>"
-        if action_link
+def render_login_page(
+    msg: str = "",
+    action_link: str = "",
+    *,
+    signup_open: bool = False,
+    signup_msg: str = "",
+    signup_error: bool = False,
+    signup_name: str = "",
+) -> str:
+    login_note = f"<p class='alert {'err' if msg else ''}'>{escape(msg)}</p>" if msg else ""
+    signup_note = (
+        f"<p class='alert {'err' if signup_error else 'ok'}'>{escape(signup_msg)}</p>"
+        if signup_msg
         else ""
     )
+    signup_ready = bool(action_link)
+    open_modal_js = "true" if (signup_open or signup_msg or signup_ready) else "false"
+    signup_name_val = escape(signup_name)
+    telegram_link_html = (
+        "<a class='btn primary' "
+        f"href='{escape(action_link)}' "
+        "target='_blank' rel='noopener noreferrer'>텔레그램 연결</a>"
+        if signup_ready
+        else ""
+    )
+    signup_submit_html = "<button type='submit' class='btn primary'>회원가입</button>" if not signup_ready else ""
     return f"""
-<!doctype html><html><head><meta charset='utf-8'><title>내 종목 관리</title>
+<!doctype html>
+<html>
+<head>
+<meta charset='utf-8'>
+<title>달봉 투자 브리핑 관리</title>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <style>
-body{{font-family:Segoe UI,Apple SD Gothic Neo,Malgun Gothic,sans-serif;background:#f3f6fb;color:#0f172a;margin:0}}
-.wrap{{max-width:720px;margin:24px auto;padding:0 14px}}
-.panel{{background:#fff;border:1px solid #dbe3ef;border-radius:14px;padding:18px}}
-label{{font-size:13px;color:#475569}}
-input{{width:100%;padding:11px;border:1px solid #cbd5e1;border-radius:10px;margin-top:6px}}
-button{{background:#0f172a;color:#fff;border:0;padding:11px 14px;border-radius:10px;cursor:pointer;width:100%}}
-.msg.err{{color:#b91c1c}}
-.mini{{font-size:12px;color:#64748b}}
-@media (max-width:700px){{.wrap{{margin:12px auto}} .panel{{padding:14px}}}}
-</style></head>
-<body><div class='wrap'><div class='panel'>
-<h2>내 종목 관리 로그인</h2>
-{note}
-{action_link_html}
-<form method='get' action='/manage'>
-<label>이름</label><input name='name' required/><br/><br/>
-<label>PIN</label><input name='pin' type='password' required/><br/><br/>
-<button type='submit'>로그인</button>
-</form>
-<p class='mini' style='margin-top:14px'>처음 사용자라면 아래 회원가입을 사용하세요.</p>
-<form method='post' action='/manage/signup' style='display:grid;gap:8px;margin-top:8px'>
-<label>회원가입용 이름</label><input name='name' required/>
-<label>회원가입용 PIN</label><input name='pin' type='password' required/>
-<button type='submit'>회원가입 + 텔레그램 등록 요청</button>
-</form>
-</div></div></body></html>
+:root {{
+  --bg: #f5f7fb;
+  --card: #ffffff;
+  --text: #101828;
+  --sub: #667085;
+  --line: #e5eaf2;
+  --primary: #3182f6;
+  --primary-press: #2563eb;
+  --shadow: 0 14px 36px rgba(15, 23, 42, 0.08);
+  --radius: 20px;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  font-family: "Pretendard","Apple SD Gothic Neo","Malgun Gothic","Segoe UI",sans-serif;
+  background:
+    radial-gradient(900px 400px at 15% -10%, rgba(49,130,246,0.10), transparent 60%),
+    radial-gradient(800px 360px at 100% 0%, rgba(14,165,233,0.08), transparent 60%),
+    var(--bg);
+  color: var(--text);
+}}
+.page {{
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding:
+    max(24px, env(safe-area-inset-top))
+    16px
+    calc(24px + env(safe-area-inset-bottom) + var(--kb-offset, 0px));
+}}
+.card {{
+  width: 100%;
+  max-width: 460px;
+  background: var(--card);
+  border: 1px solid rgba(229, 234, 242, 0.95);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 28px 24px 22px;
+}}
+.brand {{
+  margin: 0 0 8px;
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}}
+.desc {{
+  margin: 0 0 22px;
+  color: var(--sub);
+  font-size: 14px;
+  line-height: 1.5;
+}}
+.field {{
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}}
+.field label {{
+  font-size: 13px;
+  color: #475467;
+  font-weight: 600;
+}}
+.input {{
+  width: 100%;
+  height: 50px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0 14px;
+  background: #fff;
+  color: var(--text);
+  font-size: 15px;
+  outline: none;
+}}
+.input:focus {{
+  border-color: #93c5fd;
+  box-shadow: 0 0 0 4px rgba(49,130,246,0.12);
+}}
+.stack {{ display: grid; gap: 10px; }}
+.btn {{
+  width: 100%;
+  height: 52px;
+  border-radius: 14px;
+  border: 0;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}}
+.btn.primary {{
+  background: var(--primary);
+  color: #fff;
+  box-shadow: 0 8px 18px rgba(49,130,246,0.22);
+}}
+.btn.primary:hover {{ background: var(--primary-press); }}
+.btn.secondary {{
+  background: #eef4ff;
+  color: #2457c5;
+  border: 1px solid #d8e6ff;
+}}
+.btn.secondary:hover {{ background: #e6f0ff; }}
+.alert {{
+  margin: 0 0 14px;
+  padding: 12px 13px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.45;
+  border: 1px solid #e5eaf2;
+  background: #f8fafc;
+  color: #334155;
+}}
+.alert.err {{
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b42318;
+}}
+.alert.ok {{
+  background: #eff8ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}}
+.helper {{
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--sub);
+  text-align: center;
+}}
+.overlay {{
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.46);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding:
+    max(18px, env(safe-area-inset-top))
+    18px
+    calc(18px + env(safe-area-inset-bottom) + var(--kb-offset, 0px));
+  z-index: 30;
+}}
+.overlay.open {{ display: flex; }}
+.overlay.keyboard-open {{ align-items: flex-start; }}
+.modal-wrap {{
+  position: relative;
+  width: 100%;
+  max-width: 460px;
+}}
+.modal-backdrop {{
+  position: fixed;
+  inset: 0;
+}}
+.modal {{
+  position: relative;
+  width: 100%;
+  background: #fff;
+  border-radius: 20px;
+  box-shadow: 0 24px 48px rgba(15,23,42,0.16);
+  border: 1px solid rgba(229,234,242,0.95);
+  padding: 22px 18px 18px;
+  z-index: 1;
+}}
+.modal-head {{
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}}
+.modal-title {{
+  margin: 0;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}}
+.modal-sub {{
+  margin: 6px 0 0;
+  color: var(--sub);
+  font-size: 13px;
+  line-height: 1.45;
+}}
+.close-btn {{
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 12px;
+  cursor: pointer;
+  color: #344054;
+  font-size: 18px;
+}}
+@media (max-width: 520px) {{
+  body.keyboard-open .page {{ place-items: start center; }}
+  .card {{ padding: 24px 18px 18px; border-radius: 18px; }}
+  .brand {{ font-size: 24px; }}
+  .modal {{ border-radius: 18px; }}
+}}
+</style>
+</head>
+<body>
+<div class='page'>
+  <div class='card'>
+    <h1 class='brand'>💰 달봉 투자 브리핑</h1>
+    <p class='desc'>내 종목, 하락 알림 기준, 뉴스 키워드를 간편하게 관리하세요.</p>
+    {login_note}
+    <form method='get' action='/manage' class='stack'>
+      <div class='field'>
+        <label for='login-name'>이름</label>
+        <input id='login-name' class='input' name='name' autocomplete='username' required />
+      </div>
+      <div class='field'>
+        <label for='login-pin'>PIN</label>
+        <input id='login-pin' class='input' name='pin' type='password' autocomplete='current-password' required />
+      </div>
+      <button type='submit' class='btn primary'>로그인</button>
+    </form>
+    <div style='height:10px'></div>
+    <button type='button' class='btn primary' onclick='openSignupModal()'>회원가입</button>
+    <p class='helper'>회원가입 후 텔레그램에서 시작 버튼을 눌러 연동을 완료하세요.</p>
+  </div>
+</div>
+
+<div id='signup-overlay' class='overlay' aria-hidden='true'>
+  <div class='modal-wrap'>
+    <div class='modal-backdrop' onclick='closeSignupModal()' aria-hidden='true'></div>
+    <div class='modal' role='dialog' aria-modal='true' aria-labelledby='signup-title'>
+      <div class='modal-head'>
+        <div>
+          <h2 id='signup-title' class='modal-title'>회원가입</h2>
+          <p class='modal-sub'>가입 요청 후 텔레그램 연결을 완료하면 관리자 승인 대기 상태가 됩니다.</p>
+        </div>
+        <button type='button' class='close-btn' onclick='closeSignupModal()' aria-label='닫기'>×</button>
+      </div>
+      {signup_note}
+      <form method='post' action='/manage/signup' class='stack' {'style="display:none"' if signup_ready else ''}>
+        <div class='field'>
+          <label for='signup-name'>이름(닉네임)</label>
+          <input id='signup-name' class='input' name='name' value='{signup_name_val}' autocomplete='nickname' required />
+        </div>
+        <div class='field'>
+          <label for='signup-pin'>비밀번호 (PIN)</label>
+          <input id='signup-pin' class='input' name='pin' type='password' autocomplete='new-password' required />
+        </div>
+        {signup_submit_html}
+      </form>
+      <div class='stack' {'style="display:none"' if not signup_ready else ''}>
+        {telegram_link_html}
+        <button type='button' class='btn secondary' onclick='closeSignupModal()'>닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const signupOverlay = document.getElementById('signup-overlay');
+function syncKeyboardViewport() {{
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const keyboardHeight = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+  const kbOffset = keyboardHeight > 70 ? Math.min(keyboardHeight, 420) : 0;
+  document.documentElement.style.setProperty('--kb-offset', `${{kbOffset}}px`);
+  document.body.classList.toggle('keyboard-open', kbOffset > 0);
+  signupOverlay.classList.toggle('keyboard-open', kbOffset > 0 && signupOverlay.classList.contains('open'));
+
+  const ae = document.activeElement;
+  if (kbOffset > 0 && ae && ae.matches && ae.matches('input, textarea')) {{
+    setTimeout(() => ae.scrollIntoView({{ block: 'center', inline: 'nearest' }}), 40);
+  }}
+}}
+function openSignupModal() {{
+  signupOverlay.classList.add('open');
+  signupOverlay.setAttribute('aria-hidden', 'false');
+  syncKeyboardViewport();
+  setTimeout(() => {{
+    const first = document.getElementById('signup-name');
+    if (first && getComputedStyle(first).display !== 'none') first.focus();
+  }}, 0);
+}}
+function closeSignupModal() {{
+  signupOverlay.classList.remove('open');
+  signupOverlay.classList.remove('keyboard-open');
+  signupOverlay.setAttribute('aria-hidden', 'true');
+}}
+document.addEventListener('focusin', () => {{
+  setTimeout(syncKeyboardViewport, 20);
+}});
+document.addEventListener('focusout', () => {{
+  setTimeout(syncKeyboardViewport, 120);
+}});
+document.addEventListener('keydown', (e) => {{
+  if (e.key === 'Escape') closeSignupModal();
+}});
+if (window.visualViewport) {{
+  window.visualViewport.addEventListener('resize', syncKeyboardViewport);
+  window.visualViewport.addEventListener('scroll', syncKeyboardViewport);
+}}
+window.addEventListener('resize', syncKeyboardViewport);
+if ({open_modal_js}) {{
+  openSignupModal();
+}}
+syncKeyboardViewport();
+</script>
+</body>
+</html>
 """
+
 
 
 def redirect_manage(name: str, pin: str, msg: str) -> RedirectResponse:
@@ -1010,21 +1341,40 @@ def manage_signup(name: str = Form(...), pin: str = Form(...)):
     nm = normalize_name(name)
     pinv = str(pin).strip()
     if not NAME_RE.fullmatch(nm):
-        return HTMLResponse(render_login_page("이름 형식 오류"), status_code=400)
+        return HTMLResponse(
+            render_login_page(signup_open=True, signup_msg="이름 형식 오류", signup_error=True, signup_name=nm),
+            status_code=400,
+        )
     if len(pinv) < 4:
-        return HTMLResponse(render_login_page("PIN은 4자리 이상"), status_code=400)
+        return HTMLResponse(
+            render_login_page(signup_open=True, signup_msg="PIN은 4자리 이상 입력해 주세요.", signup_error=True, signup_name=nm),
+            status_code=400,
+        )
     with db_conn() as conn:
         exists = conn.execute("SELECT 1 FROM manage_users WHERE name = ?", (nm,)).fetchone()
         if exists:
-            return HTMLResponse(render_login_page("이미 존재하는 이름입니다"), status_code=400)
+            return HTMLResponse(
+                render_login_page(signup_open=True, signup_msg="이미 사용 중인 이름입니다.", signup_error=True, signup_name=nm),
+                status_code=400,
+            )
         token = create_pending_registration(conn, nm, pinv)
 
     deep_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=reg_{token}" if TELEGRAM_BOT_USERNAME else ""
-    guide = "텔레그램 봇 설정이 없어 운영자에게 문의하세요."
+    guide = "텔레그램 봇 설정이 없어 운영자에게 문의해 주세요."
     if deep_link:
-        guide = "가입 요청 저장됨. 텔레그램 봇으로 이동해 시작 버튼을 누르세요(자동 연동)."
-        return HTMLResponse(render_login_page(guide, action_link=deep_link))
-    return HTMLResponse(render_login_page(f"가입 요청 저장됨. {guide}"))
+        guide = "가입 요청이 저장되었습니다. 텔레그램 연결 후 시작 버튼을 눌러 주세요."
+        return HTMLResponse(
+            render_login_page(
+                signup_open=True,
+                signup_msg=guide,
+                signup_error=False,
+                signup_name=nm,
+                action_link=deep_link,
+            )
+        )
+    return HTMLResponse(
+        render_login_page(signup_open=True, signup_msg=f"가입 요청이 저장되었습니다. {guide}", signup_name=nm)
+    )
 
 
 @app.post("/telegram/webhook")
@@ -1049,8 +1399,14 @@ async def telegram_webhook(request: Request):
     if token and chat_id:
         with db_conn() as conn:
             linked = link_pending_registration_by_token(conn, token, chat_id)
-        if linked:
+        if linked and linked.get("ok"):
             send_telegram_message(chat_id, "등록 요청이 접수되었습니다. 관리자 승인 후 알림이 활성화됩니다.")
+            notify_admin_signup_request(str(linked.get("name", "")), chat_id)
+        elif linked and linked.get("error") == "duplicate_chat_id":
+            send_telegram_message(
+                chat_id,
+                f"이미 다른 사용자({linked.get('owner_name','unknown')})에 등록된 채팅방입니다. 중복 등록은 허용되지 않습니다.",
+            )
     return JSONResponse({"ok": True})
 
 
@@ -1064,7 +1420,13 @@ def telegram_link(token: str = Query(default=""), chat_id: str = Query(default="
         linked = link_pending_registration_by_token(conn, t, cid)
     if not linked:
         return JSONResponse({"ok": False, "error": "token not found"}, status_code=404)
+    if linked.get("error") == "duplicate_chat_id":
+        return JSONResponse(
+            {"ok": False, "error": "duplicate_chat_id", "owner_name": linked.get("owner_name", "")},
+            status_code=409,
+        )
     send_telegram_message(cid, "등록 요청이 접수되었습니다. 관리자 승인 후 알림이 활성화됩니다.")
+    notify_admin_signup_request(str(linked.get("name", "")), cid)
     return JSONResponse({"ok": True, "chat_id": cid})
 
 
@@ -1170,15 +1532,19 @@ def manage_admin_add_user(
         if int(user["is_admin"] or 0) != 1:
             return redirect_manage(name, pin, "관리자 권한 필요")
         nm = normalize_name(new_name)
+        new_cid = str(new_chat_id).strip()
         if not NAME_RE.fullmatch(nm):
             return redirect_manage(name, pin, "새 사용자 이름 형식 오류")
-        if not str(new_chat_id).strip().isdigit():
+        if not new_cid.isdigit():
             return redirect_manage(name, pin, "chat_id 형식 오류")
+        owner = find_user_by_chat_id(conn, new_cid)
+        if owner and normalize_name(str(owner["name"])) != nm:
+            return redirect_manage(name, pin, f"이미 사용 중인 chat_id 입니다 ({owner['name']})")
         upsert_user(
             conn,
             nm,
             str(new_pin).strip(),
-            str(new_chat_id).strip(),
+            new_cid,
             1 if new_is_admin else 0,
             1 if new_enabled else 0,
         )
@@ -1197,6 +1563,9 @@ def manage_admin_approve_signup(name: str = Form(...), pin: str = Form(...), tar
             return redirect_manage(name, pin, "승인 대상 없음")
         if str(row["status"]) != "linked" or not str(row["chat_id"] or "").strip().isdigit():
             return redirect_manage(name, pin, "텔레그램 연동 전입니다")
+        owner = find_user_by_chat_id(conn, str(row["chat_id"]))
+        if owner and normalize_name(str(owner["name"])) != tn:
+            return redirect_manage(name, pin, f"이미 사용 중인 chat_id 입니다 ({owner['name']})")
         upsert_user(conn, tn, str(row["pin"]), str(row["chat_id"]), 0, 1)
         with conn:
             conn.execute(

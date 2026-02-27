@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+import hashlib
 import io
 import json
 import logging
@@ -27,6 +28,34 @@ DEFAULT_OVERSIZE_BUY_SHARES = 1
 GLOBAL_BRIEF_CHAT_ID = "__MARKET_BRIEF__"
 MARKET_BRIEF_TEMPLATE_VERSION = "v2"
 ECONOMY_BRIEF_TEMPLATE_VERSION = "v3"
+DONATE_URL = "https://qr.kakaopay.com/FL40EvAYX"
+
+SCORE_MAX_INDICATORS = 8
+BUY_SCORE_RATIO_MIN = 0.5
+BUY_RSI_MAX = 30.0
+BUY_STOCH_MAX = 20.0
+SELL_RSI_STRONG = 70.0
+SELL_STOCH_STRONG = 80.0
+SELL_RSI_BB = 65.0
+SELL_SCORE_RATIO_FLOOR = 0.2
+SELL_BB_UPPER_PROXIMITY_PCT = 0.005
+LLM_CANDIDATE_TOP_N = 5
+UNIVERSE_TOP_PER_GROUP = 2
+UNIVERSE_STRONG_BUY_RATIO = 1.0
+UNIVERSE_REASON_TAG_MAX = 5
+
+UNIVERSE_DOW30_SYMBOLS = [
+    "AAPL", "AMGN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS", "GS",
+    "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
+    "MSFT", "NKE", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WBA", "WMT",
+]
+UNIVERSE_NASDAQ_MAJOR_SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "AVGO", "COST",
+    "NFLX", "AMD", "ADBE", "PEP", "CSCO", "TMUS", "CMCSA", "INTC", "INTU", "QCOM",
+    "AMGN", "TXN", "HON", "AMAT", "BKNG", "ISRG", "ADP", "GILD", "LRCX", "MU",
+    "PANW", "SNPS", "KLAC", "MELI", "CDNS", "MAR", "CTAS", "FTNT", "ORLY", "ABNB",
+    "PYPL", "ADSK", "CRWD", "MRVL", "WDAY", "NXPI", "REGN", "MNST", "AEP", "KDP",
+]
 
 NEWS_BUCKET_KEYWORDS: dict[str, tuple[str, ...]] = {
     "macro": (
@@ -151,7 +180,7 @@ class TelegramClient:
             self._post("sendMessage", {"chat_id": chat_id, "text": c, "disable_web_page_preview": "true"})
 
     def send_text_with_buttons(self, chat_id: str, text: str, buttons: list[dict[str, str]]):
-        rows = [[{"text": b["text"], "url": b["url"]}] for b in buttons if b.get("text") and b.get("url")]
+        rows = build_inline_keyboard_rows(buttons)
         payload = {
             "chat_id": chat_id,
             "text": text,
@@ -161,11 +190,34 @@ class TelegramClient:
         self._post("sendMessage", payload)
 
 
+def build_inline_keyboard_rows(buttons: list[dict[str, str]]) -> list[list[dict[str, str]]]:
+    return [[{"text": b["text"], "url": b["url"]}] for b in buttons if b.get("text") and b.get("url")]
+
+
+def build_daily_report_buttons(
+    market_brief_url: str = "",
+    economy_brief_url: str = "",
+    report_url: str = "",
+    manage_url: str = "",
+) -> list[dict[str, str]]:
+    buttons: list[dict[str, str]] = []
+    if market_brief_url:
+        buttons.append({"text": "📰 마켓 브리프", "url": market_brief_url})
+    if economy_brief_url:
+        buttons.append({"text": "📚 경제분석 리포트", "url": economy_brief_url})
+    if report_url:
+        buttons.append({"text": "📊 내 종목 현황", "url": report_url})
+    if manage_url:
+        buttons.append({"text": "⚙️ 내 종목 관리", "url": manage_url})
+        buttons.append({"text": "💖 후원하기(카카오)", "url": DONATE_URL})
+    return buttons
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="NAS-only alert runner")
     p.add_argument("--db-path", default="/data/stock_prices.db")
     p.add_argument("--symbols-file", default="/app/chat-configs.js")
-    p.add_argument("--task", choices=["daily_report", "morning_card", "envelope_watch"], required=True)
+    p.add_argument("--task", choices=["daily_report", "morning_card", "envelope_watch", "universe_scan"], required=True)
     p.add_argument("--telegram-token", default="")
     p.add_argument("--telegram-chat-ids-json", default="")
     p.add_argument("--telegram-chat-id", default="")
@@ -408,6 +460,17 @@ def ensure_alert_schema(conn: sqlite3.Connection):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candidate_brief_cache (
+            cache_date TEXT NOT NULL,
+            cache_key TEXT NOT NULL,
+            brief_json TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            PRIMARY KEY (cache_date, cache_key)
+        )
+        """
+    )
     conn.commit()
 
 
@@ -496,6 +559,256 @@ def load_chat_report_html(conn: sqlite3.Connection, token: str) -> str | None:
     if not row:
         return None
     return str(row[0] or "")
+
+
+def load_candidate_brief_cache(conn: sqlite3.Connection, cache_date: str, cache_key: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT brief_json FROM candidate_brief_cache WHERE cache_date = ? AND cache_key = ?",
+        (cache_date, cache_key),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(str(row[0] or ""))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def save_candidate_brief_cache(conn: sqlite3.Connection, cache_date: str, cache_key: str, brief: dict[str, Any]):
+    now_utc = now_utc_iso()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO candidate_brief_cache(cache_date, cache_key, brief_json, updated_at_utc)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(cache_date, cache_key) DO UPDATE SET
+              brief_json=excluded.brief_json,
+              updated_at_utc=excluded.updated_at_utc
+            """,
+            (cache_date, cache_key, json.dumps(brief, ensure_ascii=False), now_utc),
+        )
+
+
+def build_portfolio_coach_token(date_kst: str) -> str:
+    return f"portfolio_coach:{date_kst}"
+
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(v)))
+
+
+def compute_portfolio_diagnosis(stock_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [r for r in stock_rows if isinstance(r, dict)]
+    drawdown20_count = 0
+    vol_surge_count = 0
+    ma_up_count = 0
+    ma_down_count = 0
+    atr_vals: list[float] = []
+    atr_high_count = 0
+    oversold_count = 0
+    risk_points_items: list[tuple[str, float]] = []
+
+    for r in rows:
+        sym = str(r.get("symbol", "")).strip()
+        name = str(r.get("name", sym)).strip()
+        label = f"{name}({sym})" if sym else name
+        rp = 0.0
+
+        dd60 = r.get("highDrawdownPct")
+        if dd60 is not None:
+            try:
+                ddn = float(dd60)
+                if ddn <= -0.30:
+                    rp += 3
+                elif ddn <= -0.20:
+                    rp += 2
+                if ddn <= -0.20:
+                    drawdown20_count += 1
+            except Exception:
+                pass
+
+        rsi = r.get("rsi14")
+        if rsi is not None:
+            try:
+                rsin = float(rsi)
+                if rsin < 25:
+                    rp += 3
+                elif rsin < 30:
+                    rp += 2
+                if rsin < 30:
+                    oversold_count += 1
+            except Exception:
+                pass
+
+        vr = r.get("volumeRatio20")
+        if vr is not None:
+            try:
+                vrn = float(vr)
+                if vrn >= 3.0:
+                    rp += 2
+                elif vrn >= 2.0:
+                    rp += 1
+                if vrn >= 2.0:
+                    vol_surge_count += 1
+            except Exception:
+                pass
+
+        ma20 = r.get("ma20")
+        ma60 = r.get("ma60")
+        if ma20 is not None and ma60 is not None:
+            try:
+                m20 = float(ma20)
+                m60 = float(ma60)
+                if m20 > m60:
+                    ma_up_count += 1
+                elif m20 < m60:
+                    ma_down_count += 1
+                    rp += 1
+            except Exception:
+                pass
+
+        atrp = r.get("atr14Pct")
+        if atrp is not None:
+            try:
+                an = float(atrp)
+                atr_vals.append(an)
+                if an >= 0.07:
+                    rp += 2
+                elif an >= 0.05:
+                    rp += 1
+                if an >= 0.05:
+                    atr_high_count += 1
+            except Exception:
+                pass
+
+        if rp > 0:
+            risk_points_items.append((label, rp))
+
+    risk_points_items.sort(key=lambda x: x[1], reverse=True)
+    total_risk_points = sum(v for _, v in risk_points_items)
+    top2_risk_points = sum(v for _, v in risk_points_items[:2])
+    risk_concentration_pct = (top2_risk_points / max(total_risk_points, 1.0)) * 100.0 if risk_points_items else 0.0
+
+    row_count = max(len(rows), 1)
+    downtrend_ratio = (ma_down_count / row_count) if row_count else 0.0
+    atr_avg = (sum(atr_vals) / len(atr_vals)) if atr_vals else None
+
+    score = 0
+    score += min(drawdown20_count, 4)
+    score += min(oversold_count, 3)
+    score += min(vol_surge_count, 2)
+    if downtrend_ratio >= 0.7:
+        score += 3
+    elif downtrend_ratio >= 0.5:
+        score += 2
+    if atr_avg is not None:
+        if atr_avg >= 0.06:
+            score += 2
+        elif atr_avg >= 0.04:
+            score += 1
+    if risk_concentration_pct >= 80:
+        score += 2
+    elif risk_concentration_pct >= 60:
+        score += 1
+    risk_score_10 = _clamp_int(score, 0, 10)
+
+    return {
+        "riskConcentrationPct": risk_concentration_pct,
+        "drawdown20Count": drawdown20_count,
+        "volSurgeCount": vol_surge_count,
+        "maUpCount": ma_up_count,
+        "maDownCount": ma_down_count,
+        "atrAvgPct": (atr_avg * 100.0) if atr_avg is not None else None,
+        "atrHighCount": atr_high_count,
+        "riskScore10": risk_score_10,
+        "riskPointsTotal": total_risk_points,
+        "riskTop2": risk_points_items[:2],
+        "rowCount": len(rows),
+    }
+
+
+def _portfolio_diag_fallback_comment(diag: dict[str, Any]) -> str:
+    s = int(diag.get("riskScore10") or 0)
+    conc = float(diag.get("riskConcentrationPct") or 0.0)
+    atr = diag.get("atrAvgPct")
+    if s >= 8:
+        return "리스크 신호가 다수 누적되어 있고 일부 종목에 위험이 집중될 수 있어 변동성 확대 구간 점검이 필요합니다."
+    if conc >= 80:
+        return "전체 위험 신호가 소수 종목에 크게 집중된 모습이라 특정 종목 이벤트 영향도를 유의해서 보시면 좋겠습니다."
+    if atr is not None and float(atr) >= 5.0:
+        return "평균 변동성이 높은 편이라 종목별 움직임 차이가 커질 수 있는 구간으로 보입니다."
+    return "위험 신호는 일부 존재하지만 전반적으로 분산된 편이며 지표 변화 방향을 함께 추적하면 좋겠습니다."
+
+
+def get_or_create_portfolio_coach_line(conn: sqlite3.Connection, today_kst: str, diag: dict[str, Any]) -> str:
+    token = build_portfolio_coach_token(today_kst)
+    cached = (load_chat_report_html(conn, token) or "").strip()
+    if cached:
+        return cached
+
+    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        line = _portfolio_diag_fallback_comment(diag)
+        save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, line)
+        return line
+
+    payload = {
+        "risk_score_10": int(diag.get("riskScore10") or 0),
+        "row_count": int(diag.get("rowCount") or 0),
+        "risk_concentration_pct": round(float(diag.get("riskConcentrationPct") or 0.0), 1),
+        "drawdown_20_count": int(diag.get("drawdown20Count") or 0),
+        "vol_surge_count": int(diag.get("volSurgeCount") or 0),
+        "ma_up_count": int(diag.get("maUpCount") or 0),
+        "ma_down_count": int(diag.get("maDownCount") or 0),
+        "atr_avg_pct": round(float(diag.get("atrAvgPct") or 0.0), 2) if diag.get("atrAvgPct") is not None else None,
+        "atr_high_count": int(diag.get("atrHighCount") or 0),
+        "top2_risk_items": [
+            {"name": str(n), "risk_points": float(v)} for n, v in (diag.get("riskTop2") or [])[:2]
+        ],
+    }
+    req_body = {
+        "model": "gpt-5-mini",
+        "reasoning": {"effort": "low"},
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "너는 포트폴리오 상태를 리스크 관점으로 1문장 요약한다. 투자 조언 금지(매수/매도 지시 금지), 중립 톤. 한국어 1문장, 이모지 1개 이내. 제공된 vol_surge_count, ma_up_count/ma_down_count, atr_avg_pct/atr_high_count를 가능한 경우 문장 판단 근거에 반영해라.",
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
+        ],
+        "truncation": "auto",
+        "max_output_tokens": 100,
+    }
+    line = ""
+    try:
+        req = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        obj = json.loads(raw)
+        line = re.sub(r"\s+", " ", _openai_extract_json_text(obj)).strip()
+        if line:
+            line = line.splitlines()[0].strip()
+        if len(line) > 140:
+            line = line[:139].rstrip() + "…"
+    except Exception as e:
+        LOG.warning("portfolio coach line failed: %s", e)
+        line = ""
+
+    if not line:
+        line = _portfolio_diag_fallback_comment(diag)
+    save_chat_report(conn, GLOBAL_BRIEF_CHAT_ID, token, line)
+    return line
 
 
 def build_market_brief_token(date_kst: str) -> str:
@@ -880,6 +1193,22 @@ def render_market_brief_html(
     exec_note = str(brief.get("execution_note") or "").strip()
 
     by_sym = {str(r.get("symbol", "")): r for r in market_rows}
+    def _chg_color(chg_pct: Any) -> str:
+        try:
+            n = float(chg_pct)
+        except Exception:
+            return "#6b7280"
+        if n > 0:
+            return "#c81e1e"
+        if n < 0:
+            return "#1d4ed8"
+        return "#6b7280"
+
+    def _fmt_change_span(chg_pct: Any) -> str:
+        c = fmt_report_pct(chg_pct) if chg_pct is not None else "N/A"
+        color = _chg_color(chg_pct)
+        return f"<span style='color:{color};font-weight:700;'>({escape(c)})</span>"
+
     def line_for(sym: str) -> str:
         r = by_sym.get(sym)
         if not r:
@@ -887,6 +1216,13 @@ def render_market_brief_html(
         v = f"{float(r.get('price')):,.{int(r.get('digits', 2))}f}" if r.get("price") is not None else "N/A"
         c = fmt_report_pct(r.get("change_pct")) if r.get("change_pct") is not None else "N/A"
         return f"{v} ({c})"
+
+    def line_for_html(sym: str) -> str:
+        r = by_sym.get(sym)
+        if not r:
+            return "N/A"
+        v = f"{float(r.get('price')):,.{int(r.get('digits', 2))}f}" if r.get("price") is not None else "N/A"
+        return f"{escape(v)} {_fmt_change_span(r.get('change_pct'))}"
 
     def bucket_html(title: str, key: str) -> str:
         items = buckets.get(key) if isinstance(buckets.get(key), list) else []
@@ -900,10 +1236,22 @@ def render_market_brief_html(
                 continue
             link_html = ""
             if links:
-                nums = []
+                link_buttons = []
                 for i, u in enumerate(links[:3], start=1):
-                    nums.append(f"<a href='{escape(u)}' style='color:#2563eb;text-decoration:none;' target='_blank' rel='noopener noreferrer'>{i}</a>")
-                link_html = f"<div style='margin-top:4px;font-size:12px;color:#6b7280;'>대표링크: {' · '.join(nums)}</div>"
+                    link_buttons.append(
+                        f"<a href='{escape(u)}' "
+                        "style='display:inline-block;padding:3px 8px;border-radius:999px;"
+                        "background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;"
+                        "text-decoration:none;font-weight:600;margin-right:6px;margin-top:4px;' "
+                        "target='_blank' rel='noopener noreferrer'>"
+                        f"&#50896;&#47928; &#48372;&#44592; {i}</a>"
+                    )
+                link_html = (
+                    "<div style='margin-top:6px;font-size:12px;color:#6b7280;'>"
+                    "&#45824;&#54364; &#47553;&#53356;: "
+                    + "".join(link_buttons)
+                    + "</div>"
+                )
             lis.append(f"<li style='margin-bottom:8px;'>{escape(point)}{link_html}</li>")
         if not lis:
             lis = ["<li>요약 데이터 없음</li>"]
@@ -926,8 +1274,9 @@ def render_market_brief_html(
         if sym not in {"KRW=X", "^TNX", "CL=F", "GC=F"}:
             continue
         v = f"{float(r.get('price')):,.{int(r.get('digits', 2))}f}" if r.get("price") is not None else "N/A"
-        c = fmt_report_pct(r.get("change_pct")) if r.get("change_pct") is not None else "N/A"
-        indicator_lines.append(f"<td style='padding:6px 0;'><b>{escape(str(r.get('name','')))}</b> {escape(v)} <span style='color:#6b7280;'>({escape(c)})</span></td>")
+        indicator_lines.append(
+            f"<td style='padding:6px 0;'><b>{escape(str(r.get('name','')))}</b> {escape(v)} {_fmt_change_span(r.get('change_pct'))}</td>"
+        )
     if len(indicator_lines) < 4:
         indicator_lines += ["<td style='padding:6px 0;'>데이터 없음</td>"] * (4 - len(indicator_lines))
 
@@ -1025,9 +1374,9 @@ def render_market_brief_html(
                 <div style="padding:12px;border-radius:14px;background:#f9fafb;border:1px solid #eef2f7;">
                   <div style="font-size:13px;font-weight:900;margin-bottom:8px;">🇺🇸 미국 (전일 마감)</div>
                   <div style="font-size:13px;line-height:1.7;">
-                    S&P 500: <b>{escape(line_for("^GSPC"))}</b><br/>
-                    NASDAQ: <b>{escape(line_for("^IXIC"))}</b><br/>
-                    DOW: <b>{escape(line_for("^DJI"))}</b><br/>
+                    S&P 500: <b>{line_for_html("^GSPC")}</b><br/>
+                    NASDAQ: <b>{line_for_html("^IXIC")}</b><br/>
+                    DOW: <b>{line_for_html("^DJI")}</b><br/>
                     <b>한 줄 코멘트:</b> {escape(us_dash)}
                   </div>
                 </div>
@@ -1036,9 +1385,9 @@ def render_market_brief_html(
                 <div style="padding:12px;border-radius:14px;background:#f9fafb;border:1px solid #eef2f7;">
                   <div style="font-size:13px;font-weight:900;margin-bottom:8px;">🇰🇷 한국 (개장 전 프리뷰)</div>
                   <div style="font-size:13px;line-height:1.7;">
-                    KOSPI: <b>{escape(line_for("^KS11"))}</b><br/>
-                    KOSDAQ: <b>{escape(line_for("^KQ11"))}</b><br/>
-                    원/달러: <b>{escape(line_for("KRW=X"))}</b><br/>
+                    KOSPI: <b>{line_for_html("^KS11")}</b><br/>
+                    KOSDAQ: <b>{line_for_html("^KQ11")}</b><br/>
+                    원/달러: <b>{line_for_html("KRW=X")}</b><br/>
                     <b>한 줄 코멘트:</b> {escape(kr_dash)}
                   </div>
                 </div>
@@ -1212,7 +1561,7 @@ def render_economy_brief_html(today: str, now_time: str, digest: dict[str, Any],
 <div style='max-width:780px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:18px;'>
 <div style='font-size:13px;color:#6b7280;'>📘 Economy Report Brief</div>
 <div style='font-size:26px;font-weight:900;margin-top:6px;'>{escape(today)} {escape(now_time)} KST</div>
-<div style='font-size:13px;color:#6b7280;margin-top:4px;'>생성시각: 13시 이후 1회 · 발송시각: 14시 이후 1회</div>
+<div style='font-size:13px;color:#6b7280;margin-top:4px;'>생성시각: 15시 이후 1회 · 발송시각: 16시 이후 1회</div>
 <div style='margin-top:14px;padding:12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;line-height:1.7;'>{overview or '요약 없음'}</div>
 <div style='margin-top:14px;font-weight:900;'>리포트 목록 (최대 10개)</div>
 <ul style='line-height:1.7;padding-left:18px;'>{''.join(lis)}</ul>
@@ -1224,7 +1573,7 @@ def get_or_create_economy_brief_report(conn: sqlite3.Connection, today: str, now
     existing = load_chat_report_html(conn, token)
     if existing:
         return token
-    reports = fetch_naver_economy_reports(limit=15)
+    reports = fetch_naver_economy_reports(limit=5)
     reports = [r for r in reports if _is_naver_report_date_today(str(r.get("date") or ""), today)]
     if not reports:
         LOG.info("economy brief skipped: no reports for %s", today)
@@ -1242,6 +1591,21 @@ def get_or_create_economy_brief_report(conn: sqlite3.Connection, today: str, now
 def _candidate_payload_rows(rows: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in rows[:limit]:
+        ma20 = r.get("ma20")
+        ma60 = r.get("ma60")
+        ma_trend = ""
+        try:
+            if ma20 is not None and ma60 is not None:
+                m20 = float(ma20)
+                m60 = float(ma60)
+                if m20 > m60:
+                    ma_trend = "up"
+                elif m20 < m60:
+                    ma_trend = "down"
+                else:
+                    ma_trend = "flat"
+        except Exception:
+            ma_trend = ""
         out.append(
             {
                 "symbol": str(r.get("symbol", "")),
@@ -1254,35 +1618,30 @@ def _candidate_payload_rows(rows: list[dict[str, Any]], limit: int = 6) -> list[
                 "macd": r.get("macd"),
                 "macdSignal": r.get("macdSignal"),
                 "adx14": r.get("adx14"),
+                "volumeRatio20": r.get("volumeRatio20"),
+                "ma20": ma20,
+                "ma60": ma60,
+                "ma20DiffPct": r.get("ma20DiffPct"),
+                "ma60DiffPct": r.get("ma60DiffPct"),
+                "maTrend": ma_trend,
+                "atr14Pct": r.get("atr14Pct"),
                 "high52wDrawdownPct": r.get("high52wDrawdownPct"),
                 "bbText": str(r.get("bbText", "")),
                 "score": int(r.get("score", 0)),
-                "max": int(r.get("max", 5)),
+                "max": int(r.get("max", SCORE_MAX_INDICATORS)),
+                "candidateClass": str(r.get("candidateClass", "NONE")),
             }
         )
     return out
 
 
-def openai_candidate_brief_json(
-    market_rows: list[dict[str, Any]],
-    buy_candidates: list[dict[str, Any]],
-    sell_candidates: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
-    if not api_key:
-        LOG.info("openai candidate_brief skipped: missing OPENAI_API_KEY")
-        return None
-    if not buy_candidates and not sell_candidates:
-        return {"summary": "", "buy": [], "sell": []}
-
-    model = (os.getenv("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
-
-    market_compact = []
+def _candidate_brief_market_rows(market_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for r in market_rows:
         sym = str(r.get("symbol", ""))
         if sym not in {"^KS11", "^KQ11", "^IXIC", "^GSPC", "^DJI", "KRW=X", "^TNX", "CL=F", "GC=F"}:
             continue
-        market_compact.append(
+        out.append(
             {
                 "symbol": sym,
                 "name": str(r.get("name", "")),
@@ -1290,23 +1649,79 @@ def openai_candidate_brief_json(
                 "changePct": r.get("change_pct"),
             }
         )
+    return sorted(out, key=lambda x: str(x.get("symbol", "")))
+
+
+def _candidate_brief_cache_key(
+    market_rows: list[dict[str, Any]],
+    buy_candidates: list[dict[str, Any]],
+    sell_candidates: list[dict[str, Any]],
+    watch_candidates: list[dict[str, Any]],
+) -> str:
+    key_payload = {
+        "market": _candidate_brief_market_rows(market_rows),
+        "buy": _candidate_payload_rows(
+            sorted(buy_candidates, key=lambda r: (str(r.get("symbol", "")), str(r.get("name", "")))),
+            LLM_CANDIDATE_TOP_N,
+        ),
+        "sell": _candidate_payload_rows(
+            sorted(sell_candidates, key=lambda r: (str(r.get("symbol", "")), str(r.get("name", "")))),
+            LLM_CANDIDATE_TOP_N,
+        ),
+        "watch": _candidate_payload_rows(
+            sorted(watch_candidates, key=lambda r: (str(r.get("symbol", "")), str(r.get("name", "")))),
+            LLM_CANDIDATE_TOP_N,
+        ),
+    }
+    normalized = json.dumps(key_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def openai_candidate_brief_json(
+    market_rows: list[dict[str, Any]],
+    buy_candidates: list[dict[str, Any]],
+    sell_candidates: list[dict[str, Any]],
+    watch_candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        LOG.info("openai candidate_brief skipped: missing OPENAI_API_KEY")
+        return None
+    if not buy_candidates and not sell_candidates and not watch_candidates:
+        return {"summary": "", "buy": [], "sell": [], "watch": []}
+
+    model = (os.getenv("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+
+    market_compact = _candidate_brief_market_rows(market_rows)
 
     payload = {
         "market": market_compact,
-        "buy_candidates": _candidate_payload_rows(buy_candidates, 6),
-        "sell_candidates": _candidate_payload_rows(sell_candidates, 6),
+        "candidates": {
+            "buy": _candidate_payload_rows(buy_candidates, LLM_CANDIDATE_TOP_N),
+            "sell": _candidate_payload_rows(sell_candidates, LLM_CANDIDATE_TOP_N),
+            "watch": _candidate_payload_rows(watch_candidates, LLM_CANDIDATE_TOP_N),
+        },
+        "classification_definition": {
+            "BUY": "신규 분할매수 관찰/진입 후보",
+            "SELL": "강한 신호, 익절/리스크 관리 고려",
+            "WATCH": "과열 주의, 매도 단정 금지",
+        },
         "format": {
-            "summary": "시장/섹터 톤 1~2문장",
+            "summary": "6~10줄 이내 간결 요약",
             "buy": [{"symbol": "", "name": "", "brief": "", "risk": "", "plan": ""}],
             "sell": [{"symbol": "", "name": "", "brief": "", "risk": "", "plan": ""}],
+            "watch": [{"symbol": "", "name": "", "brief": "", "risk": "", "plan": ""}],
         },
         "rules": [
-            "한국어",
+            "Korean",
             "JSON only",
-            "각 종목 2~3문장 수준의 매우 짧은 전문가 톤",
-            "가격예측 단정 금지",
-            "지표/시황 연결 중심",
-            "입력에 없는 정보 추정 최소화",
+            "Keep summary concise in 6-10 short lines",
+            "Mention top candidates only (up to 5 per class)",
+            "Each candidate should reflect indicators directly (2-3 short sentences total across brief/risk/plan)",
+            "No price prediction, no certainty claims",
+            "Use volumeRatio20, MA20/MA60(or maTrend), and atr14Pct when present",
+            "Do not invent missing values",
+            "Never phrase WATCH as sell recommendation",
         ],
     }
 
@@ -1314,7 +1729,15 @@ def openai_candidate_brief_json(
         "model": model,
         "reasoning": {"effort": "low"},
         "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": "주식 데일리 브리퍼. 입력 지표와 시황만 사용. JSON만 출력."}]},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Stock daily brief writer. Use only provided data and output JSON only. Classification is fixed: SELL=strong signal for profit-taking/risk management, WATCH=caution only (not a sell call), BUY=observation/entry candidate. Reflect RSI/StochRSI/MACD/MA20-60/Bollinger/score plus volumeRatio20 and atr14Pct when available. Write Korean text values.",
+                    }
+                ],
+            },
             {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
         ],
         "text": {"format": {"type": "json_object"}},
@@ -1326,11 +1749,12 @@ def openai_candidate_brief_json(
     for attempt in range(3):
         try:
             LOG.info(
-                "openai candidate_brief call attempt=%s model=%s buy_candidates=%s sell_candidates=%s max_output_tokens=%s",
+                "openai candidate_brief call attempt=%s model=%s buy_candidates=%s sell_candidates=%s watch_candidates=%s max_output_tokens=%s",
                 attempt + 1,
                 model,
                 len(buy_candidates),
                 len(sell_candidates),
+                len(watch_candidates),
                 req_body.get("max_output_tokens"),
             )
             req = Request(
@@ -1381,10 +1805,28 @@ def openai_candidate_brief_json(
     return None
 
 
+
 def fallback_candidate_brief_json(
     buy_candidates: list[dict[str, Any]],
     sell_candidates: list[dict[str, Any]],
+    watch_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    def _fmt_num(v: Any, digits: int = 1) -> str:
+        try:
+            if v is None:
+                return "N/A"
+            return f"{float(v):.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v: Any, digits: int = 1) -> str:
+        try:
+            if v is None:
+                return "N/A"
+            return f"{float(v) * 100:.{digits}f}%"
+        except Exception:
+            return "N/A"
+
     def one_line(r: dict[str, Any], side: str) -> dict[str, str]:
         name = str(r.get("name", ""))
         sym = str(r.get("symbol", ""))
@@ -1393,18 +1835,216 @@ def fallback_candidate_brief_json(
         macd = r.get("macd")
         sig = r.get("macdSignal")
         score = int(r.get("score", 0))
+        maxv = int(r.get("max", 8))
         bb = str(r.get("bbText", ""))
-        trend = "상승 우위" if (macd is not None and sig is not None and macd > sig) else "하락 우위"
-        brief = f"점수 {score}/5, RSI {f'{float(rsi):.1f}' if rsi is not None else 'N/A'}, ADX {f'{float(adx):.1f}' if adx is not None else 'N/A'} 기준으로 {trend} 흐름 체크."
-        risk = "변동성 확대 시 분할 대응" if side == "buy" else "반등 시 되돌림 실패 여부 확인"
-        plan = "추격보다 눌림 확인 후 분할" if side == "buy" else "반등시 비중 축소/리스크 관리 우선"
-        return {"symbol": sym, "name": name, "brief": brief, "risk": risk, "plan": f"{plan} · {bb}"}
+        vol20 = r.get("volumeRatio20")
+        ma20 = r.get("ma20")
+        ma60 = r.get("ma60")
+        atrp = r.get("atr14Pct")
+        trend = "?? ??" if (macd is not None and sig is not None and macd > sig) else "?? ??"
+        ma_bias = "MA N/A"
+        try:
+            if ma20 is not None and ma60 is not None:
+                if float(ma20) > float(ma60):
+                    ma_bias = "MA20>MA60"
+                elif float(ma20) < float(ma60):
+                    ma_bias = "MA20<MA60"
+                else:
+                    ma_bias = "MA20=MA60"
+        except Exception:
+            ma_bias = "MA N/A"
+        brief = (
+            f"?? {score}/{maxv}, RSI {f'{float(rsi):.1f}' if rsi is not None else 'N/A'}, ADX {f'{float(adx):.1f}' if adx is not None else 'N/A'}, "
+            f"Vol(20D) {_fmt_num(vol20, 2)}x, {ma_bias}, ATR {_fmt_pct(atrp, 2)} ???? {trend} ?? ??."
+        )
+        if side == "buy":
+            risk = f"변동성(ATR {_fmt_pct(atrp, 2)})와 거래량({_fmt_num(vol20, 2)}x) 과열 여부를 같이 확인"
+            plan = f"신규 분할매수 관찰/진입 후보로 관리 (Vol/ATR 체크) | {bb}"
+        elif side == "watch":
+            risk = f"과열 구간 신호일 수 있으나 단일 지표일 가능성도 있어 추격 진입은 보수적으로"
+            plan = f"매도 단정 대신 과열 완화/추세 확인 중심으로 관찰 | {bb}"
+        else:
+            risk = f"모멘텀 약화 또는 추세 약세 동반 여부를 우선 점검 ({ma_bias})"
+            plan = f"익절/리스크 관리 관점에서 비중 점검 또는 기준 이탈 관리 | {bb}"
+        return {"symbol": sym, "name": name, "brief": brief, "risk": risk, "plan": plan}
 
     return {
-        "summary": "후보 종목은 지표 점수와 MACD/ADX 추세를 우선 확인하고, 장중에는 환율·지수 방향성과 함께 보세요.",
+        "summary": "?? ??? RSI/MACD/ADX? ?? Vol(20D), MA20/60, ATR%? ?? ??? ?????? ??? ?? ???.",
         "buy": [one_line(r, "buy") for r in buy_candidates[:6]],
         "sell": [one_line(r, "sell") for r in sell_candidates[:6]],
+        "watch": [one_line(r, "watch") for r in watch_candidates[:6]],
     }
+
+
+
+def _fmt_brief_num(v: Any, digits: int = 1) -> str:
+    try:
+        if v is None:
+            return "N/A"
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_brief_pct(v: Any, digits: int = 1) -> str:
+    try:
+        if v is None:
+            return "N/A"
+        return f"{float(v) * 100:.{digits}f}%"
+    except Exception:
+        return "N/A"
+
+
+def _fallback_symbol_brief_item(r: dict[str, Any], side: str) -> dict[str, str]:
+    name = str(r.get("name", ""))
+    sym = str(r.get("symbol", ""))
+    rsi = r.get("rsi14")
+    adx = r.get("adx14")
+    macd = r.get("macd")
+    sig = r.get("macdSignal")
+    score = int(r.get("score", 0))
+    maxv = int(r.get("max", SCORE_MAX_INDICATORS))
+    bb = str(r.get("bbText", ""))
+    vol20 = r.get("volumeRatio20")
+    ma20 = r.get("ma20")
+    ma60 = r.get("ma60")
+    atrp = r.get("atr14Pct")
+    trend = "상승 우위" if (macd is not None and sig is not None and macd > sig) else "하락 우위"
+    ma_bias = "MA N/A"
+    try:
+        if ma20 is not None and ma60 is not None:
+            if float(ma20) > float(ma60):
+                ma_bias = "MA20>MA60"
+            elif float(ma20) < float(ma60):
+                ma_bias = "MA20<MA60"
+            else:
+                ma_bias = "MA20=MA60"
+    except Exception:
+        ma_bias = "MA N/A"
+    brief = (
+        f"점수 {score}/{maxv}, RSI {f'{float(rsi):.1f}' if rsi is not None else 'N/A'}, ADX {f'{float(adx):.1f}' if adx is not None else 'N/A'}, "
+        f"Vol(20D) {_fmt_brief_num(vol20, 2)}x, {ma_bias}, ATR {_fmt_brief_pct(atrp, 2)} 기준으로 {trend} 신호입니다."
+    )
+    if side == "buy":
+        risk = f"변동성(ATR {_fmt_brief_pct(atrp, 2)})과 거래량({_fmt_brief_num(vol20, 2)}x) 과열 여부를 같이 확인"
+        plan = f"신규 분할매수 관찰/진입 후보로 관리 (Vol/ATR 체크) | {bb}"
+    elif side == "watch":
+        risk = "과열 구간 신호일 수 있으나 단일 지표일 가능성도 있어 추격 진입은 보수적으로"
+        plan = f"매도 단정 대신 과열 완화/추세 확인 중심으로 관찰 | {bb}"
+    else:
+        risk = f"모멘텀 약화 또는 추세 약세 동반 여부를 우선 점검 ({ma_bias})"
+        plan = f"익절/리스크 관리 관점에서 비중 점검 또는 기준 이탈 관리 | {bb}"
+    return {"symbol": sym, "name": name, "brief": brief, "risk": risk, "plan": plan}
+
+
+def _symbol_brief_cache_key(market_rows: list[dict[str, Any]], row: dict[str, Any], side: str) -> str:
+    payload = {
+        "market": _candidate_brief_market_rows(market_rows),
+        "side": side,
+        "row": _candidate_payload_rows([row], 1)[0] if row else {},
+    }
+    normalized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sym:v1:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def openai_symbol_brief_json(market_rows: list[dict[str, Any]], row: dict[str, Any], side: str) -> dict[str, str] | None:
+    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    model = (os.getenv("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+    market_compact = _candidate_brief_market_rows(market_rows)
+    candidate_payload = _candidate_payload_rows([row], 1)
+    if not candidate_payload:
+        return None
+    payload = {
+        "market": market_compact,
+        "candidate_class": side.upper(),
+        "candidate": candidate_payload[0],
+        "classification_definition": {
+            "BUY": "신규 분할매수 관찰/진입 후보",
+            "SELL": "강한 신호, 익절/리스크 관리 고려",
+            "WATCH": "과열 주의, 매도 단정 금지",
+        },
+        "format": {"brief": "", "risk": "", "plan": ""},
+        "rules": [
+            "Korean",
+            "JSON only",
+            "2-3 short sentences total",
+            "No certainty claims, no price prediction",
+            "Never phrase WATCH as sell recommendation",
+        ],
+    }
+    req_body = {
+        "model": model,
+        "reasoning": {"effort": "low"},
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Stock candidate brief writer. Use only provided data. SELL means risk-management signal, WATCH means caution only and must not be described as sell call, BUY means observation/entry candidate. Output JSON only with brief/risk/plan in Korean.",
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
+        ],
+        "text": {"format": {"type": "json_object"}},
+        "truncation": "auto",
+        "max_output_tokens": 300,
+    }
+    try:
+        req = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=40) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        obj = json.loads(raw)
+        _log_openai_usage("symbol_brief", obj, extra=f"symbol={row.get('symbol')} class={side}")
+        txt = _openai_extract_json_text(obj).strip()
+        if not txt:
+            return None
+        parsed = json.loads(txt)
+        if not isinstance(parsed, dict):
+            return None
+        return {
+            "symbol": str(row.get("symbol", "")),
+            "name": str(row.get("name", "")),
+            "brief": str(parsed.get("brief", "")).strip(),
+            "risk": str(parsed.get("risk", "")).strip(),
+            "plan": str(parsed.get("plan", "")).strip(),
+        }
+    except Exception as e:
+        LOG.warning("openai symbol_brief failed symbol=%s class=%s err=%s", row.get("symbol"), side, e)
+        return None
+
+
+def get_or_build_symbol_brief_item(
+    conn: sqlite3.Connection | None,
+    today: str,
+    market_rows: list[dict[str, Any]],
+    row: dict[str, Any],
+    side: str,
+    shared_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    key = _symbol_brief_cache_key(market_rows, row, side)
+    if shared_cache is not None and key in shared_cache:
+        return shared_cache[key]
+    if conn is not None:
+        cached = load_candidate_brief_cache(conn, today, key)
+        if isinstance(cached, dict):
+            if shared_cache is not None:
+                shared_cache[key] = cached
+            return cached
+    item = openai_symbol_brief_json(market_rows, row, side) or _fallback_symbol_brief_item(row, side)
+    if conn is not None:
+        save_candidate_brief_cache(conn, today, key, item)
+    if shared_cache is not None:
+        shared_cache[key] = item
+    return item
 
 
 def get_or_build_candidate_brief_for_chat(
@@ -1412,19 +2052,38 @@ def get_or_build_candidate_brief_for_chat(
     today: str,
     market_rows: list[dict[str, Any]],
     report_stock_rows: list[dict[str, Any]],
+    conn: sqlite3.Connection | None = None,
+    shared_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     cached = state.get("candidate_brief_json")
     if state.get("candidate_brief_date") == today and isinstance(cached, dict):
         return cached, False
 
-    buy_candidates = [r for r in report_stock_rows if bool(r.get("buyCandidate"))]
-    sell_candidates = [r for r in report_stock_rows if bool(r.get("sellCandidate"))]
-    if not buy_candidates and not sell_candidates:
-        brief = {"summary": "", "buy": [], "sell": []}
-    else:
-        brief = openai_candidate_brief_json(market_rows, buy_candidates, sell_candidates) or fallback_candidate_brief_json(
-            buy_candidates, sell_candidates
-        )
+    buy_candidates = [r for r in report_stock_rows if bool(r.get("buyCandidate"))][:LLM_CANDIDATE_TOP_N]
+    sell_candidates = [r for r in report_stock_rows if bool(r.get("sellCandidate"))][:LLM_CANDIDATE_TOP_N]
+    watch_candidates = [r for r in report_stock_rows if bool(r.get("watchCandidate"))][:LLM_CANDIDATE_TOP_N]
+
+    buy_items = [get_or_build_symbol_brief_item(conn, today, market_rows, r, "buy", shared_cache) for r in buy_candidates]
+    sell_items = [get_or_build_symbol_brief_item(conn, today, market_rows, r, "sell", shared_cache) for r in sell_candidates]
+    watch_items = [get_or_build_symbol_brief_item(conn, today, market_rows, r, "watch", shared_cache) for r in watch_candidates]
+
+    summary_lines = [
+        f"BUY {len(buy_candidates)}개 / SELL {len(sell_candidates)}개 / WATCH {len(watch_candidates)}개",
+        "SELL은 익절/리스크 관리 관점, WATCH는 과열 주의(매도 아님) 기준으로 정리했습니다.",
+    ]
+    if buy_items:
+        summary_lines.append("BUY 상위: " + ", ".join([str(x.get("name") or x.get("symbol") or "") for x in buy_items[:3]]))
+    if sell_items:
+        summary_lines.append("SELL 상위: " + ", ".join([str(x.get("name") or x.get("symbol") or "") for x in sell_items[:3]]))
+    if watch_items:
+        summary_lines.append("WATCH 상위: " + ", ".join([str(x.get("name") or x.get("symbol") or "") for x in watch_items[:3]]))
+
+    brief = {
+        "summary": "\n".join(summary_lines),
+        "buy": buy_items,
+        "sell": sell_items,
+        "watch": watch_items,
+    }
     state["candidate_brief_date"] = today
     state["candidate_brief_json"] = brief
     return brief, True
@@ -1468,10 +2127,13 @@ def render_chat_report_html(
     now_time: str,
     buy_list: list[str],
     sell_list: list[str],
+    watch_list: list[str],
+    universe_suggestions: dict[str, Any] | None,
     stock_rows: list[dict[str, Any]],
     manage_url: str,
     market_rows: list[dict[str, Any]] | None = None,
     candidate_brief: dict[str, Any] | None = None,
+    portfolio_diag: dict[str, Any] | None = None,
 ):
     def fmt_opt(v: Any, digits: int) -> str:
         if v is None:
@@ -1529,7 +2191,7 @@ def render_chat_report_html(
         if n < 20:
             return badge("매수", "p-buy")
         if n > 80:
-            return badge("매도", "p-sell")
+            return badge("과열주의", "p-watch")
         return badge("중립", "p-neutral")
 
     def macd_badge(macd_v: Any, sig_v: Any) -> str:
@@ -1562,17 +2224,66 @@ def render_chat_report_html(
             return badge("고점권", "p-sell")
         return badge("중립", "p-neutral")
 
+    def volume_badge(v: Any) -> str:
+        try:
+            n = float(v)
+        except Exception:
+            return badge("N/A", "p-neutral")
+        if n >= 2.0:
+            return badge("급증", "p-trend-strong")
+        if n >= 1.2:
+            return badge("증가", "p-trend-build")
+        if n < 0.8:
+            return badge("약함", "p-trend-weak")
+        return badge("보통", "p-neutral")
+
+    def ma_badge(price_v: Any, ma20_v: Any, ma60_v: Any) -> str:
+        try:
+            p = float(price_v)
+            m20 = float(ma20_v)
+            m60 = float(ma60_v)
+        except Exception:
+            return badge("N/A", "p-neutral")
+        if p >= m20 and m20 >= m60:
+            return badge("상승", "p-buy")
+        if p < m20 and m20 < m60:
+            return badge("하락", "p-sell")
+        return badge("혼조", "p-neutral")
+
+    def atr_badge(v: Any) -> str:
+        try:
+            n = float(v)
+        except Exception:
+            return badge("N/A", "p-neutral")
+        if n <= 0.03:
+            return badge("안정", "p-buy")
+        if n <= 0.06:
+            return badge("보통", "p-neutral")
+        return badge("변동성↑", "p-sell")
+
     def stock_table_rows(rows_in: list[dict[str, Any]]) -> str:
         html_rows = []
         for r in rows_in:
-            score = int(r.get("score", 0))
-            tone = "buy" if score >= 4 else "mid" if score >= 2 else "sell"
+            if bool(r.get("sellCandidate")):
+                tone = "sell"
+            elif bool(r.get("buyCandidate")):
+                tone = "buy"
+            elif bool(r.get("watchCandidate")):
+                tone = "watch"
+            else:
+                score = int(r.get("score", 0))
+                maxv = max(1, int(r.get("max", SCORE_MAX_INDICATORS)))
+                ratio = score / maxv
+                tone = "buy" if ratio >= 0.75 else "mid" if ratio >= 0.35 else "sell"
             sym_txt = str(r.get("symbol", ""))
             name_txt = str(r.get("name", ""))
             chart_url = tradingview_chart_url(sym_txt)
             ccy = str(r.get("ccy", "USD"))
             chg_pct = r.get("changePct")
             macd_txt = f"{fmt_opt(r.get('macd'), 2)} / {fmt_opt(r.get('macdSignal'), 2)}"
+            vol_ratio_txt = f"{float(r.get('volumeRatio20')):.2f}x" if r.get("volumeRatio20") is not None else "N/A"
+            ma_txt = f"{fmt_opt(r.get('ma20'), 1)} / {fmt_opt(r.get('ma60'), 1)}"
+            atr_txt = fmt_report_pct(r.get("atr14Pct")) if r.get("atr14Pct") is not None else "N/A"
             html_rows.append(
                 f"<tr class='row-{tone}'>"
                 f"<td class='sticky-col'><a class='ticker-link' href='{escape(chart_url)}' target='_blank' rel='noopener noreferrer'>{escape(name_txt)}</a><div class='subsym'>{escape(sym_txt)}</div></td>"
@@ -1583,21 +2294,24 @@ def render_chat_report_html(
                 f"<td>{metric_value(fmt_opt(r.get('stochRsi14'), 3), stoch_badge(r.get('stochRsi14')))}</td>"
                 f"<td>{metric_value(macd_txt, macd_badge(r.get('macd'), r.get('macdSignal')))}</td>"
                 f"<td>{metric_value(fmt_opt(r.get('adx14'), 1), adx_badge(r.get('adx14')))}</td>"
+                f"<td>{metric_value(vol_ratio_txt, volume_badge(r.get('volumeRatio20')))}</td>"
+                f"<td>{metric_value(ma_txt, ma_badge(r.get('price'), r.get('ma20'), r.get('ma60')))}</td>"
+                f"<td>{metric_value(atr_txt, atr_badge(r.get('atr14Pct')))}</td>"
                 f"<td>{metric_value(fmt_report_pct(r.get('high52wDrawdownPct')), high52_badge(r.get('high52wDrawdownPct')))}</td>"
                 f"<td class='bb-cell'>{escape(str(r.get('bbText', '')))}</td>"
-                f"<td><span class='score-chip'>{int(r.get('score', 0))}/{int(r.get('max', 5))}</span></td>"
+                f"<td><span class='score-chip'>{int(r.get('score', 0))}/{int(r.get('max', 8))}</span></td>"
                 "</tr>"
             )
         return "".join(html_rows)
 
     market_rows = market_rows or []
     candidate_brief = candidate_brief or {}
+    portfolio_diag = portfolio_diag or {}
     groups = [
         ("📈 주요 지수", {"^KS11", "^KQ11", "^N225", "^DJI", "^IXIC", "^GSPC", "000001.SS", "^HSI"}),
         ("🪙 원자재/암호", {"BTC-USD", "GC=F", "CL=F"}),
         ("💱 환율", {"KRW=X"}),
         ("🏦 금리", {"^TNX"}),
-        ("🧩 기타", set()),
     ]
     market_cards: list[str] = []
     for title, syms in groups:
@@ -1624,6 +2338,58 @@ def render_chat_report_html(
     cb_summary = str(candidate_brief.get("summary", "") or "").strip()
     cb_buy = candidate_brief.get("buy") if isinstance(candidate_brief.get("buy"), list) else []
     cb_sell = candidate_brief.get("sell") if isinstance(candidate_brief.get("sell"), list) else []
+    cb_watch = candidate_brief.get("watch") if isinstance(candidate_brief.get("watch"), list) else []
+    coach_line = str(portfolio_diag.get("coachLine", "") or "").strip()
+    risk_top2 = portfolio_diag.get("riskTop2") if isinstance(portfolio_diag.get("riskTop2"), list) else []
+    top2_meta_items: list[str] = []
+    for it in risk_top2[:2]:
+        if not (isinstance(it, (list, tuple)) and len(it) >= 2):
+            continue
+        nm = str(it[0]).strip()
+        try:
+            pts = float(it[1])
+        except Exception:
+            continue
+        if nm:
+            top2_meta_items.append(f"{nm} ({pts:.0f}p)")
+    top2_meta = " / ".join(top2_meta_items)
+    atr_avg_pct_val = portfolio_diag.get("atrAvgPct")
+    atr_avg_pct_text = "N/A"
+    if atr_avg_pct_val is not None:
+        try:
+            atr_avg_pct_text = f"{float(atr_avg_pct_val):.1f}%"
+        except Exception:
+            atr_avg_pct_text = "N/A"
+    diag_card_html = (
+        "<div class='ai-block'><div class='ai-title'>📊 포트폴리오 진단</div><div class='diag-card'>"
+        + f"<div class='diag-line'><b>🎯 리스크 집중도</b> 상위2 리스크 집중도: {float(portfolio_diag.get('riskConcentrationPct', 0.0)):.1f}%</div>"
+        + f"<div class='diag-line'><b>📉 고점대비 -20% 이상 종목</b> {int(portfolio_diag.get('drawdown20Count', 0))}개 (60일 고점 기준)</div>"
+        + f"<div class='diag-line'><b>📈 거래량 급증 종목</b> {int(portfolio_diag.get('volSurgeCount', 0))}개 (≥2.0x)</div>"
+        + f"<div class='diag-line'><b>📏 MA20/MA60</b> MA20&gt;MA60 {int(portfolio_diag.get('maUpCount', 0))}개 / MA20&lt;MA60 {int(portfolio_diag.get('maDownCount', 0))}개</div>"
+        + f"<div class='diag-line'><b>🌪 ATR% 평균</b> {atr_avg_pct_text} / ATR% 높음(≥5%) {int(portfolio_diag.get('atrHighCount', 0))}개</div>"
+        + f"<div class='diag-line'><b>⚠ 위험 점수</b> {int(portfolio_diag.get('riskScore10', 0))}/10</div>"
+        + (f"<div class='diag-line'><b>🧩 상위 리스크 기여</b> {escape(top2_meta)}</div>" if top2_meta else "")
+        + f"<div class='diag-line'><b>🧠 AI 한 줄 코멘트</b> {escape(coach_line or '코멘트 없음')}</div>"
+        + "</div></div>"
+    )
+
+    indicator_guide_html = """
+<details class='panel guide-panel'>
+  <summary class='guide-summary'>📘 지표 읽는 법 (클릭)</summary>
+  <div class='guide-grid'>
+    <div class='guide-item'><b>RSI</b> 단기 과열/과매도 지표입니다. 보통 70 이상은 과열, 30 이하는 과매도로 참고합니다.</div>
+    <div class='guide-item'><b>StochRSI</b> RSI의 민감한 버전입니다. 80 이상 과열, 20 이하 과매도 구간으로 자주 봅니다.</div>
+    <div class='guide-item'><b>MACD/Sig</b> 추세 방향 지표입니다. MACD가 Signal 위면 상승 우위, 아래면 하락 우위로 봅니다.</div>
+    <div class='guide-item'><b>ADX</b> 추세의 강도를 보여줍니다. 보통 25 이상이면 추세가 강한 편입니다.</div>
+    <div class='guide-item'><b>Vol(20D)</b> 오늘 거래량이 최근 20일 평균 대비 몇 배인지입니다. 2.0x 이상이면 거래량 급증입니다.</div>
+    <div class='guide-item'><b>MA20/60</b> 20일/60일 이동평균입니다. MA20&gt;MA60이면 상승 흐름, 반대면 약세 흐름 참고값입니다.</div>
+    <div class='guide-item'><b>ATR%</b> ATR(14)을 현재가 대비 %로 본 값입니다. 높을수록 변동성이 큽니다.</div>
+    <div class='guide-item'><b>52주 고점비</b> 52주 최고점 대비 현재 위치입니다. 낙폭이 클수록 저점권 가능성이 있지만 약세 지속도 함께 봐야 합니다.</div>
+    <div class='guide-item'><b>Bollinger</b> 가격의 밴드 위치입니다. 상단 근처는 과열 경계, 하단 근처는 과매도 구간으로 참고합니다.</div>
+    <div class='guide-item'><b>Score</b> 여러 지표를 합친 참고 점수입니다. 단독보다 MACD/거래량/추세와 함께 보세요.</div>
+  </div>
+  <div class='guide-note'>※ 지표는 참고용입니다. 여러 지표가 같은 방향일 때 신뢰도가 상대적으로 높아집니다.</div>
+</details>"""
 
     def brief_cards(items: list[Any], title: str, tone: str) -> str:
         cards = []
@@ -1646,8 +2412,58 @@ def render_chat_report_html(
         if not cards:
             return ""
         return f"<div class='ai-block'><div class='ai-title'>{escape(title)}</div><div class='ai-grid'>{''.join(cards)}</div></div>"
+
+    def universe_cards_html() -> str:
+        uni = universe_suggestions if isinstance(universe_suggestions, dict) else {}
+        rows_map = uni.get("rows") if isinstance(uni.get("rows"), dict) else {}
+        summary_map = uni.get("summary") if isinstance(uni.get("summary"), dict) else {}
+        title_map = {
+            "KOSPI200": "KOSPI200",
+            "KOSDAQ100": "KOSDAQ100",
+            "NASDAQ_MAJOR": "NASDAQ MAJOR",
+            "DOW30": "DOW30",
+        }
+        blocks: list[str] = []
+        for key in ("KOSPI200", "KOSDAQ100", "NASDAQ_MAJOR", "DOW30"):
+            lst = rows_map.get(key) if isinstance(rows_map.get(key), list) else []
+            if not lst:
+                continue
+            summary_text = str(summary_map.get(key) or "").strip() or "추천 이유 요약 없음"
+            lines: list[str] = []
+            for r in lst[:UNIVERSE_TOP_PER_GROUP]:
+                sym = str(r.get("symbol", ""))
+                nm = str(r.get("name", "") or sym)
+                ccy = str(r.get("ccy", "USD"))
+                price = fmt_money(r.get("price"), ccy) if r.get("price") is not None else "N/A"
+                score_txt = f"{int(r.get('score', 0))}/{int(r.get('max', SCORE_MAX_INDICATORS))}"
+                url = tradingview_chart_url(sym) if sym else ""
+                name_html = (
+                    f"<a class='ticker-link' href='{escape(url)}' target='_blank' rel='noopener noreferrer'>{escape(nm)}</a>"
+                    if url
+                    else escape(nm)
+                )
+                lines.append(
+                    "<div class='u-item'>"
+                    f"<div class='u-name'>{name_html} <span class='u-sym'>{escape(sym)}</span></div>"
+                    f"<div class='u-meta'>가격 {escape(price)} · 점수 {escape(score_txt)}</div>"
+                    "</div>"
+                )
+            body = "".join(lines)
+            blocks.append(
+                "<section class='panel universe-panel'>"
+                f"<h3>📌 {escape(title_map[key])}</h3>"
+                f"<div class='u-summary'>{escape(summary_text)}</div>"
+                f"<div class='u-list'>{body}</div>"
+                "</section>"
+            )
+        if not blocks:
+            return (
+                "<div class='section-title'>🤖 AI 종목 제안</div>"
+                "<section class='panel universe-panel'><div class='u-none'>추천 종목 없음</div></section>"
+            )
+        return "<div class='section-title'>🤖 AI 종목 제안</div><div class='u-grid'>" + "".join(blocks) + "</div>"
     return f"""<!doctype html>
-<html><head><meta charset='utf-8'><title>종목 현황</title>
+<html><head><meta charset='utf-8'><title>내 종목 현황</title>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <style>
 body{{font-family:Segoe UI,Apple SD Gothic Neo,Malgun Gothic,sans-serif;margin:0;background:linear-gradient(180deg,#f8fbff 0%,#eef4fb 100%);color:#0f172a}}
@@ -1655,7 +2471,7 @@ body{{font-family:Segoe UI,Apple SD Gothic Neo,Malgun Gothic,sans-serif;margin:0
 .top{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
 .title{{font-size:24px;font-weight:700}}
 .meta{{color:#475569;font-size:14px}}
-.cards{{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:10px;margin:14px 0}}
+.cards{{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:10px;margin:14px 0}}
 .card,.panel{{background:#fff;border:1px solid #dbe3ef;border-radius:14px;padding:12px;box-shadow:0 4px 16px rgba(15,23,42,.04)}}
 .card .label{{font-size:12px;color:#64748b}}
 .card .val{{font-size:14px;font-weight:700;margin-top:6px;line-height:1.5}}
@@ -1663,6 +2479,15 @@ body{{font-family:Segoe UI,Apple SD Gothic Neo,Malgun Gothic,sans-serif;margin:0
 .panel h3{{margin:0 0 10px 0;font-size:15px}}
 .metric-panel{{padding:14px}}
 .mgrid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
+.u-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px}}
+.universe-panel h3{{margin:0 0 8px 0}}
+.u-summary{{font-size:12px;line-height:1.5;color:#334155;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:8px}}
+.u-list{{margin-top:8px;display:flex;flex-direction:column;gap:8px}}
+.u-item{{border:1px solid #e2e8f0;border-radius:10px;padding:8px;background:#fff}}
+.u-name{{font-size:13px;font-weight:700;color:#0f172a}}
+.u-sym{{font-size:11px;color:#64748b;margin-left:4px}}
+.u-meta{{font-size:12px;color:#475569;margin-top:4px}}
+.u-none{{font-size:12px;color:#64748b}}
 .mlist{{display:flex;flex-direction:column;gap:4px}}
 .mrow{{display:grid;grid-template-columns:minmax(0,1.2fr) auto auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #eef2f7}}
 .mrow:last-child{{border-bottom:0}}
@@ -1687,6 +2512,7 @@ th.sticky-col{{z-index:3;background:#f8fafc}}
 .pill{{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid transparent}}
 .p-buy{{background:#dcfce7;color:#166534;border-color:#86efac}}
 .p-sell{{background:#fee2e2;color:#b91c1c;border-color:#fca5a5}}
+.p-watch{{background:#fef3c7;color:#92400e;border-color:#fcd34d}}
 .p-neutral{{background:#dbeafe;color:#1d4ed8;border-color:#93c5fd}}
 .p-trend-strong{{background:#ede9fe;color:#6d28d9;border-color:#c4b5fd}}
 .p-trend-build{{background:#dbeafe;color:#1d4ed8;border-color:#93c5fd}}
@@ -1704,6 +2530,18 @@ th.sticky-col{{z-index:3;background:#f8fafc}}
 .ai-card{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#fff}}
 .ai-card.buytone{{background:#f0fdf4;border-color:#bbf7d0}}
 .ai-card.selltone{{background:#fef2f2;border-color:#fecaca}}
+.ai-card.watchtone{{background:#fffbeb;border-color:#fde68a}}
+.diag-card{{border:1px solid #dbeafe;border-radius:12px;padding:10px;background:linear-gradient(180deg,#f8fbff 0%,#eef6ff 100%)}}
+.diag-line{{font-size:12px;line-height:1.55;color:#334155;margin-top:4px}}
+.diag-line:first-child{{margin-top:0}}
+.diag-line b{{color:#0f172a}}
+.guide-panel{{margin-top:10px}}
+.guide-summary{{cursor:pointer;font-weight:700;font-size:14px;color:#0f172a;list-style:none}}
+.guide-summary::-webkit-details-marker{{display:none}}
+.guide-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px}}
+.guide-item{{font-size:12px;line-height:1.55;color:#334155;border:1px solid #e2e8f0;border-radius:10px;padding:9px;background:#fbfdff}}
+.guide-item b{{color:#0f172a}}
+.guide-note{{margin-top:8px;font-size:12px;color:#64748b}}
 .ai-head{{font-size:13px;margin-bottom:6px}}
 .ai-head span{{color:#64748b;font-size:12px;margin-left:4px}}
 .ai-line{{font-size:12px;line-height:1.55;color:#334155;margin-top:4px}}
@@ -1711,6 +2549,7 @@ th.sticky-col{{z-index:3;background:#f8fafc}}
 .row-buy{{background:#ecfdf5}}
 .row-mid{{background:#fff}}
 .row-sell{{background:#fef2f2}}
+.row-watch{{background:#fffbeb}}
 .scroll{{overflow:auto;border-radius:12px}}
 @media (max-width: 768px) {{
   .title{{font-size:20px}}
@@ -1723,36 +2562,40 @@ th.sticky-col{{z-index:3;background:#f8fafc}}
 <body><div class='wrap'>
 <div class='top'>
   <div>
-    <div class='title'>📊 종목 현황</div>
+    <div class='title'>📊 내 종목 현황</div>
     <div class='meta'>{escape(today)} {escape(now_time)}</div>
   </div>
   {manage_html}
 </div>
+{universe_cards_html()}
 <div class='cards'>
   <div class='card'><div class='label'>매수 후보 리스트</div><div class='val'>{escape(', '.join(buy_list) if buy_list else '없음')}</div></div>
   <div class='card'><div class='label'>매도 후보 리스트</div><div class='val'>{escape(', '.join(sell_list) if sell_list else '없음')}</div></div>
+  <div class='card'><div class='label'>과열 주의(WATCH) 리스트</div><div class='val'>{escape(', '.join(watch_list) if watch_list else '없음')}</div></div>
 </div>
 <div class='panel ai-panel'>
   <h3>🤖 후보 브리핑</h3>
   <div class='ai-summary'>{escape(cb_summary or '후보 종목이 없거나 요약 데이터가 없습니다. 지표 기반 표를 우선 확인하세요.')}</div>
+  {diag_card_html}
   {brief_cards(cb_buy, "🟢 매수 후보 브리핑", "buytone")}
   {brief_cards(cb_sell, "🔴 매도 후보 브리핑", "selltone")}
+  {brief_cards(cb_watch, "🟡 과열 주의(WATCH) 브리핑", "watchtone")}
 </div>
 <div class='section-title'>🇰🇷 한국 주식</div>
 <div class='scroll'>
 <table>
-<tr><th class='sticky-col'>종목</th><th>현재가</th><th>전일종가</th><th>등락률</th><th>RSI</th><th>StochRSI</th><th>MACD/Sig</th><th>ADX</th><th>52주고점비</th><th>Bollinger</th><th>Score</th></tr>
-{stock_table_rows(kr_rows) if kr_rows else "<tr><td colspan='11'>표시할 종목이 없습니다.</td></tr>"}
+<tr><th class='sticky-col'>종목</th><th>현재가</th><th>전일종가</th><th>등락률</th><th>RSI</th><th>StochRSI</th><th>MACD/Sig</th><th>ADX</th><th>Vol(20D)</th><th>MA20/60</th><th>ATR%</th><th>52주고점비</th><th>Bollinger</th><th>Score</th></tr>
+{stock_table_rows(kr_rows) if kr_rows else "<tr><td colspan='14'>표시할 종목이 없습니다.</td></tr>"}
 </table>
 </div>
 <div class='section-title'>🇺🇸 미국 주식</div>
 <div class='scroll'>
 <table>
-<tr><th class='sticky-col'>종목</th><th>현재가</th><th>전일종가</th><th>등락률</th><th>RSI</th><th>StochRSI</th><th>MACD/Sig</th><th>ADX</th><th>52주고점비</th><th>Bollinger</th><th>Score</th></tr>
-{stock_table_rows(us_rows) if us_rows else "<tr><td colspan='11'>표시할 종목이 없습니다.</td></tr>"}
+<tr><th class='sticky-col'>종목</th><th>현재가</th><th>전일종가</th><th>등락률</th><th>RSI</th><th>StochRSI</th><th>MACD/Sig</th><th>ADX</th><th>Vol(20D)</th><th>MA20/60</th><th>ATR%</th><th>52주고점비</th><th>Bollinger</th><th>Score</th></tr>
+{stock_table_rows(us_rows) if us_rows else "<tr><td colspan='14'>표시할 종목이 없습니다.</td></tr>"}
 </table>
 </div>
-<div class='section-title'>📌 주요지표현황</div>
+{indicator_guide_html}
 <div class='mgrid'>{''.join(market_cards)}</div>
 </div></body></html>"""
 
@@ -2146,7 +2989,7 @@ def stoch_rsi_signal(v: float | None) -> tuple[str, str]:
     if v < 20:
         return "🟢", "매수 후보(<20)"
     if v > 80:
-        return "🔴", "매도 경계(>80)"
+        return "🟡", "과열 주의(>80)"
     return "⚪", "중립(20~80)"
 
 
@@ -2184,11 +3027,23 @@ def bollinger_signal(price: float | None, middle: float | None, upper: float | N
     if price <= lower:
         return "🟢 하단 밴드 터치(단기 반등 후보)"
     if price >= upper:
-        return "🔴 상단 밴드 터치(과열 경고)"
+        return "🟡 상단 밴드 터치(과열 주의)"
     return "⚪ 밴드 내부(중립)"
 
 
-def total_score(rsi: float | None, stoch: float | None, macd: float | None, macd_sig: float | None, adx: float | None, high52w_dd: float | None) -> tuple[int, int]:
+def total_score(
+    rsi: float | None,
+    stoch: float | None,
+    macd: float | None,
+    macd_sig: float | None,
+    adx: float | None,
+    high52w_dd: float | None,
+    volume_ratio20: float | None,
+    ma20: float | None,
+    ma60: float | None,
+    price_now: float | None,
+    atr14_pct: float | None,
+) -> tuple[int, int]:
     s = 0
     if rsi is not None and rsi <= 30:
         s += 1
@@ -2200,7 +3055,69 @@ def total_score(rsi: float | None, stoch: float | None, macd: float | None, macd
         s += 1
     if high52w_dd is not None and high52w_dd <= -0.2:
         s += 1
-    return s, 5
+    if volume_ratio20 is not None and volume_ratio20 >= 1.8:
+        s += 1
+    if (
+        ma20 is not None
+        and ma60 is not None
+        and price_now is not None
+        and price_now >= ma20
+        and ma20 >= ma60
+    ):
+        s += 1
+    if atr14_pct is not None and 0.0 < atr14_pct <= 0.05:
+        s += 1
+    return s, SCORE_MAX_INDICATORS
+
+
+def is_bollinger_upper_touch_or_near(price: float | None, upper: float | None) -> bool:
+    if price is None or upper is None:
+        return False
+    try:
+        p = float(price)
+        u = float(upper)
+    except Exception:
+        return False
+    if u <= 0:
+        return p >= u
+    return p >= (u * (1.0 - SELL_BB_UPPER_PROXIMITY_PCT))
+
+
+def classify_candidates(
+    score_ratio: float,
+    rsi: float | None,
+    stoch: float | None,
+    macd: float | None,
+    macd_sig: float | None,
+    ma20: float | None,
+    ma60: float | None,
+    is_bb_upper_near: bool,
+) -> tuple[bool, bool, bool, str]:
+    macd_up = macd is not None and macd_sig is not None and macd > macd_sig
+    macd_down = macd is not None and macd_sig is not None and macd < macd_sig
+    ma_down = ma20 is not None and ma60 is not None and ma20 < ma60
+
+    is_buy = score_ratio >= BUY_SCORE_RATIO_MIN and (
+        macd_up
+        or (rsi is not None and rsi <= BUY_RSI_MAX)
+        or (stoch is not None and stoch < BUY_STOCH_MAX)
+    )
+
+    sell_rule_1 = (rsi is not None and rsi >= SELL_RSI_STRONG) and (stoch is not None and stoch > SELL_STOCH_STRONG)
+    sell_rule_2 = is_bb_upper_near and (rsi is not None and rsi >= SELL_RSI_BB)
+    sell_rule_3 = (stoch is not None and stoch > SELL_STOCH_STRONG) and macd_down and ma_down
+    sell_rule_4 = (score_ratio <= SELL_SCORE_RATIO_FLOOR) and macd_down
+    is_sell = sell_rule_1 or sell_rule_2 or sell_rule_3 or sell_rule_4
+
+    watch_single_overheat = (
+        (stoch is not None and stoch > SELL_STOCH_STRONG)
+        or is_bb_upper_near
+        or (rsi is not None and rsi >= SELL_RSI_STRONG)
+    )
+    is_watch = (not is_sell) and watch_single_overheat
+
+    candidate_class = "SELL" if is_sell else "BUY" if is_buy else "WATCH" if is_watch else "NONE"
+    return is_buy, is_sell, is_watch, candidate_class
 
 
 def score_label(score: int, maxv: int) -> tuple[str, str]:
@@ -2212,6 +3129,85 @@ def score_label(score: int, maxv: int) -> tuple[str, str]:
     if ratio >= 0.25:
         return "🟡", "중립/관망"
     return "🔴", "보수적 접근"
+
+
+def load_trend_volatility_metrics(conn: sqlite3.Connection, symbol: str) -> dict[str, float | None]:
+    rows = conn.execute(
+        """
+        SELECT high, low, close, volume
+        FROM price_bars
+        WHERE symbol = ? AND interval = '1d'
+        ORDER BY trade_date_local DESC
+        LIMIT 90
+        """,
+        (symbol,),
+    ).fetchall()
+    base = {
+        "ma20": None,
+        "ma60": None,
+        "ma20DiffPct": None,
+        "ma60DiffPct": None,
+        "atr14Pct": None,
+        "volume": None,
+        "avgVolume20": None,
+        "volumeRatio20": None,
+    }
+    if not rows:
+        return base
+
+    rev = list(reversed(rows))
+    highs = [float(r[0]) if r[0] is not None else None for r in rev]
+    lows = [float(r[1]) if r[1] is not None else None for r in rev]
+    closes_raw = [float(r[2]) if r[2] is not None else None for r in rev]
+    vols = [float(r[3]) if r[3] is not None else None for r in rev]
+    closes = [c for c in closes_raw if c is not None]
+    if not closes:
+        return base
+
+    close_last = closes[-1]
+    ma20 = (sum(closes[-20:]) / 20.0) if len(closes) >= 20 else None
+    ma60 = (sum(closes[-60:]) / 60.0) if len(closes) >= 60 else None
+    ma20_diff = (close_last / ma20 - 1.0) if ma20 else None
+    ma60_diff = (close_last / ma60 - 1.0) if ma60 else None
+
+    trs: list[float] = []
+    for i in range(1, len(rev)):
+        h = highs[i]
+        l = lows[i]
+        c_prev = closes_raw[i - 1]
+        c_cur = closes_raw[i]
+        if h is None or l is None or c_prev is None or c_cur is None:
+            continue
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        trs.append(float(tr))
+    atr14_pct = None
+    if len(trs) >= 14 and close_last:
+        atr14_pct = (sum(trs[-14:]) / 14.0) / close_last
+
+    vol_last = vols[-1] if vols else None
+    vol_avg20 = None
+    prior_vols = [v for v in vols[-21:-1] if v is not None] if len(vols) >= 21 else []
+    if len(prior_vols) >= 10:
+        vol_avg20 = sum(prior_vols) / len(prior_vols)
+    else:
+        tail_vols = [v for v in vols[-20:] if v is not None]
+        if len(tail_vols) >= 10:
+            vol_avg20 = sum(tail_vols) / len(tail_vols)
+    vol_ratio20 = (vol_last / vol_avg20) if (vol_last is not None and vol_avg20 and vol_avg20 > 0) else None
+
+    base.update(
+        {
+            "ma20": ma20,
+            "ma60": ma60,
+            "ma20DiffPct": ma20_diff,
+            "ma60DiffPct": ma60_diff,
+            "atr14Pct": atr14_pct,
+            "volume": vol_last,
+            "avgVolume20": vol_avg20,
+            "volumeRatio20": vol_ratio20,
+        }
+    )
+    return base
 
 
 def load_latest_snapshots(conn: sqlite3.Connection, symbols: list[str], lookback: int) -> dict[str, dict[str, Any]]:
@@ -2263,7 +3259,366 @@ def load_latest_snapshots(conn: sqlite3.Connection, symbols: list[str], lookback
             "high52wDrawdownPct": float(row[17]) if row[17] is not None else None,
             "marketState": row[21] or "",
         }
+        out[sym].update(load_trend_volatility_metrics(conn, sym))
     return out
+
+
+def load_symbol_name_map(conn: sqlite3.Connection, symbols: list[str]) -> dict[str, str]:
+    if not symbols:
+        return {}
+    uniq = sorted({str(s).strip().upper() for s in symbols if str(s).strip()})
+    if not uniq:
+        return {}
+    placeholders = ",".join(["?"] * len(uniq))
+    rows = conn.execute(f"SELECT symbol, name FROM ticker_master WHERE symbol IN ({placeholders})", uniq).fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        sym = str(r[0] or "").strip().upper()
+        nm = str(r[1] or "").strip()
+        if sym and nm:
+            out[sym] = nm
+    return out
+
+
+def _load_universe_symbols_override() -> dict[str, list[str]]:
+    path = (os.getenv("UNIVERSE_SYMBOLS_FILE", "/app/universe_symbols.json") or "").strip()
+    if not path:
+        return {}
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {}
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            return {}
+        out: dict[str, list[str]] = {}
+        for k in ("KOSPI200", "KOSDAQ100", "NASDAQ_MAJOR", "DOW30"):
+            arr = parsed.get(k)
+            if not isinstance(arr, list):
+                continue
+            syms: list[str] = []
+            for s in arr:
+                ss = str(s or "").strip().upper()
+                if ss:
+                    syms.append(ss)
+            if syms:
+                out[k] = syms
+        return out
+    except Exception:
+        return {}
+
+
+def _load_kr_universe_from_ticker_master(conn: sqlite3.Connection, market_token: str, limit: int) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT symbol
+        FROM ticker_master
+        WHERE upper(market) LIKE ?
+        ORDER BY symbol ASC
+        LIMIT ?
+        """,
+        (f"%{market_token.upper()}%", int(limit)),
+    ).fetchall()
+    out: list[str] = []
+    for r in rows:
+        sym = str(r[0] or "").strip().upper()
+        if sym:
+            out.append(sym)
+    return out
+
+
+def load_universe_symbol_map(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    override = _load_universe_symbols_override()
+    kospi200 = override.get("KOSPI200") or _load_kr_universe_from_ticker_master(conn, "KOSPI", 200)
+    kosdaq100 = override.get("KOSDAQ100") or _load_kr_universe_from_ticker_master(conn, "KOSDAQ", 100)
+    nasdaq_major = override.get("NASDAQ_MAJOR") or list(UNIVERSE_NASDAQ_MAJOR_SYMBOLS)
+    dow30 = override.get("DOW30") or list(UNIVERSE_DOW30_SYMBOLS)
+    return {
+        "KOSPI200": kospi200,
+        "KOSDAQ100": kosdaq100,
+        "NASDAQ_MAJOR": nasdaq_major,
+        "DOW30": dow30,
+    }
+
+
+def build_universe_reason_tags(row: dict[str, Any]) -> list[str]:
+    tags: list[str] = []
+    rsi = row.get("rsi14")
+    stoch = row.get("stochRsi14")
+    macd = row.get("macd")
+    sig = row.get("macdSignal")
+    adx = row.get("adx14")
+    vol = row.get("volumeRatio20")
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    atr = row.get("atr14Pct")
+    bb_text = str(row.get("bbText", "") or "")
+    try:
+        if rsi is not None:
+            if float(rsi) <= 30:
+                tags.append("RSI 과매도")
+            elif float(rsi) >= 70:
+                tags.append("RSI 과열")
+    except Exception:
+        pass
+    try:
+        if stoch is not None:
+            if float(stoch) < 20:
+                tags.append("StochRSI 과매도")
+            elif float(stoch) > 80:
+                tags.append("StochRSI 과열")
+    except Exception:
+        pass
+    try:
+        if macd is not None and sig is not None:
+            tags.append("MACD 상향" if float(macd) > float(sig) else "MACD 하향")
+    except Exception:
+        pass
+    try:
+        if adx is not None:
+            tags.append("ADX 추세강" if float(adx) >= 25 else "ADX 추세약")
+    except Exception:
+        pass
+    try:
+        if vol is not None:
+            tags.append(f"거래량 {float(vol):.2f}x")
+    except Exception:
+        pass
+    try:
+        if ma20 is not None and ma60 is not None:
+            tags.append("MA20>MA60" if float(ma20) > float(ma60) else "MA20<MA60")
+    except Exception:
+        pass
+    try:
+        if atr is not None:
+            tags.append(f"ATR {float(atr)*100:.1f}%")
+    except Exception:
+        pass
+    if bb_text:
+        if "상단" in bb_text:
+            tags.append("볼린저 상단")
+        elif "하단" in bb_text:
+            tags.append("볼린저 하단")
+    uniq: list[str] = []
+    for t in tags:
+        if t not in uniq:
+            uniq.append(t)
+        if len(uniq) >= UNIVERSE_REASON_TAG_MAX:
+            break
+    return uniq
+
+
+def score_universe_candidates(
+    symbol_map: dict[str, list[str]],
+    snap_map: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {k: [] for k in symbol_map.keys()}
+    for uni, symbols in symbol_map.items():
+        rows: list[dict[str, Any]] = []
+        for sym in symbols:
+            s = snap_map.get(sym)
+            if not s:
+                continue
+            price_now = s.get("curPrice") or s.get("close1")
+            bb = s.get("bollinger20", {}) if isinstance(s.get("bollinger20"), dict) else {}
+            score, maxv = total_score(
+                s.get("rsi14"),
+                s.get("stochRsi14"),
+                s.get("macd"),
+                s.get("macdSignal"),
+                s.get("adx14"),
+                s.get("high52wDrawdownPct"),
+                s.get("volumeRatio20"),
+                s.get("ma20"),
+                s.get("ma60"),
+                price_now,
+                s.get("atr14Pct"),
+            )
+            ratio = (score / maxv) if maxv else 0.0
+            if ratio < UNIVERSE_STRONG_BUY_RATIO:
+                continue
+            ccy = str(s.get("ccy") or currency_of(sym))
+            rows.append(
+                {
+                    "symbol": sym,
+                    "name": sym,
+                    "ccy": ccy,
+                    "price": price_now,
+                    "changePct": s.get("curChgPct"),
+                    "rsi14": s.get("rsi14"),
+                    "stochRsi14": s.get("stochRsi14"),
+                    "macd": s.get("macd"),
+                    "macdSignal": s.get("macdSignal"),
+                    "adx14": s.get("adx14"),
+                    "volumeRatio20": s.get("volumeRatio20"),
+                    "ma20": s.get("ma20"),
+                    "ma60": s.get("ma60"),
+                    "ma20DiffPct": s.get("ma20DiffPct"),
+                    "ma60DiffPct": s.get("ma60DiffPct"),
+                    "atr14Pct": s.get("atr14Pct"),
+                    "high52wDrawdownPct": s.get("high52wDrawdownPct"),
+                    "bbText": bollinger_signal(price_now, bb.get("middle"), bb.get("upper"), bb.get("lower")),
+                    "score": score,
+                    "max": maxv,
+                    "buyScoreRatio": ratio,
+                    "reasonTags": build_universe_reason_tags(
+                        {
+                            "rsi14": s.get("rsi14"),
+                            "stochRsi14": s.get("stochRsi14"),
+                            "macd": s.get("macd"),
+                            "macdSignal": s.get("macdSignal"),
+                            "adx14": s.get("adx14"),
+                            "volumeRatio20": s.get("volumeRatio20"),
+                            "ma20": s.get("ma20"),
+                            "ma60": s.get("ma60"),
+                            "atr14Pct": s.get("atr14Pct"),
+                            "bbText": bollinger_signal(price_now, bb.get("middle"), bb.get("upper"), bb.get("lower")),
+                        }
+                    ),
+                }
+            )
+        rows.sort(key=lambda r: (float(r.get("buyScoreRatio") or 0.0), float(r.get("volumeRatio20") or 0.0)), reverse=True)
+        out[uni] = rows[:UNIVERSE_TOP_PER_GROUP]
+    return out
+
+
+def fallback_universe_summary(universe_rows: dict[str, list[dict[str, Any]]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for uni, rows in universe_rows.items():
+        if not rows:
+            out[uni] = "추천 없음"
+            continue
+        reasons: list[str] = []
+        for r in rows[:2]:
+            nm = str(r.get("name") or r.get("symbol") or "")
+            tags = r.get("reasonTags") if isinstance(r.get("reasonTags"), list) else []
+            tags_txt = ", ".join([str(x) for x in tags[:3]]) if tags else "지표 우위"
+            reasons.append(f"{nm}: {tags_txt}")
+        out[uni] = " | ".join(reasons)
+    return out
+
+
+def openai_universe_summary(
+    conn: sqlite3.Connection | None,
+    today: str,
+    universe_rows: dict[str, list[dict[str, Any]]],
+    shared_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    payload = {
+        "universes": {
+            uni: [
+                {
+                    "symbol": str(r.get("symbol", "")),
+                    "name": str(r.get("name", "")),
+                    "buyScoreRatio": r.get("buyScoreRatio"),
+                    "reasonTags": r.get("reasonTags", []),
+                }
+                for r in rows[:UNIVERSE_TOP_PER_GROUP]
+            ]
+            for uni, rows in universe_rows.items()
+        },
+        "rules": [
+            "분류/선정 금지 (이미 룰 기반 선정 완료)",
+            "유니버스별 1~2줄 한국어 이유 요약",
+            "전체 8~12줄 이내",
+            "없으면 '추천 없음'으로 표시",
+        ],
+    }
+    key_raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    cache_key = "universe_summary:v1:" + hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+    if shared_cache is not None and cache_key in shared_cache:
+        cached_obj = shared_cache[cache_key]
+        return {k: str(v) for k, v in (cached_obj if isinstance(cached_obj, dict) else {}).items()}
+    if conn is not None:
+        db_cached = load_candidate_brief_cache(conn, today, cache_key)
+        if isinstance(db_cached, dict):
+            if shared_cache is not None:
+                shared_cache[cache_key] = db_cached
+            return {k: str(v) for k, v in db_cached.items()}
+
+    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        out = fallback_universe_summary(universe_rows)
+        if conn is not None:
+            save_candidate_brief_cache(conn, today, cache_key, out)
+        if shared_cache is not None:
+            shared_cache[cache_key] = out
+        return out
+
+    model = (os.getenv("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+    req_body = {
+        "model": model,
+        "reasoning": {"effort": "low"},
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "너는 주식 유니버스 추천 이유 요약기다. 후보 선정은 이미 끝났고 너는 이유만 짧게 작성한다. JSON만 출력한다.",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                **payload,
+                                "output_format": {
+                                    "KOSPI200": "1~2줄",
+                                    "KOSDAQ100": "1~2줄",
+                                    "NASDAQ_MAJOR": "1~2줄",
+                                    "DOW30": "1~2줄",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            },
+        ],
+        "text": {"format": {"type": "json_object"}},
+        "truncation": "auto",
+        "max_output_tokens": 500,
+    }
+    try:
+        req = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        obj = json.loads(raw)
+        _log_openai_usage("universe_summary", obj)
+        txt = _openai_extract_json_text(obj).strip()
+        parsed = json.loads(txt) if txt else {}
+        out = {
+            "KOSPI200": str(parsed.get("KOSPI200", "")).strip() if isinstance(parsed, dict) else "",
+            "KOSDAQ100": str(parsed.get("KOSDAQ100", "")).strip() if isinstance(parsed, dict) else "",
+            "NASDAQ_MAJOR": str(parsed.get("NASDAQ_MAJOR", "")).strip() if isinstance(parsed, dict) else "",
+            "DOW30": str(parsed.get("DOW30", "")).strip() if isinstance(parsed, dict) else "",
+        }
+        for k in list(out.keys()):
+            if not out[k]:
+                out[k] = fallback_universe_summary(universe_rows).get(k, "추천 없음")
+        if conn is not None:
+            save_candidate_brief_cache(conn, today, cache_key, out)
+        if shared_cache is not None:
+            shared_cache[cache_key] = out
+        return out
+    except Exception as e:
+        LOG.warning("openai universe_summary failed err=%s", e)
+        out = fallback_universe_summary(universe_rows)
+        if conn is not None:
+            save_candidate_brief_cache(conn, today, cache_key, out)
+        if shared_cache is not None:
+            shared_cache[cache_key] = out
+        return out
 
 
 def shares_from_cash(cash: float, price: float | None) -> int:
@@ -2319,8 +3674,23 @@ def run_daily_report(
         base_cfg = load_chat_config(cfg, cid)
         ov = load_chat_config_override(conn, cid)
         chat_cfgs[cid] = merge_chat_config(base_cfg, ov)
-    all_symbols = sorted({t["symbol"] for c in chat_cfgs.values() for t in c.get("tickers", []) if isinstance(t, dict) and t.get("symbol")})
+    universe_symbol_map = load_universe_symbol_map(conn)
+    universe_symbols = sorted({s for arr in universe_symbol_map.values() for s in arr if s})
+    all_symbols = sorted(
+        {t["symbol"] for c in chat_cfgs.values() for t in c.get("tickers", []) if isinstance(t, dict) and t.get("symbol")}
+        | set(universe_symbols)
+    )
     snap_map = load_latest_snapshots(conn, all_symbols, runtime.lookback)
+    shared_candidate_brief_cache: dict[str, dict[str, Any]] = {}
+    symbol_name_map = load_symbol_name_map(conn, all_symbols)
+    universe_rows = score_universe_candidates(universe_symbol_map, snap_map)
+    for _, rows in universe_rows.items():
+        for r in rows:
+            sym = str(r.get("symbol", "")).upper()
+            if sym and sym in symbol_name_map:
+                r["name"] = symbol_name_map[sym]
+    universe_summary = openai_universe_summary(conn, today, universe_rows, shared_candidate_brief_cache)
+    universe_suggestions = {"rows": universe_rows, "summary": universe_summary}
 
     for chat_id in chat_ids:
         state = load_state(conn, chat_id)
@@ -2345,7 +3715,12 @@ def run_daily_report(
         blocks_us: list[str] = []
         buy_list: list[str] = []
         sell_list: list[str] = []
+        watch_list: list[str] = []
         report_stock_rows: list[dict[str, Any]] = []
+        warn_drop_5: list[str] = []
+        warn_high60_dd25: list[str] = []
+        warn_rsi25: list[str] = []
+        warn_vol3x: list[str] = []
 
         dirty = not had_report_token
 
@@ -2379,9 +3754,11 @@ def run_daily_report(
                         "high52wDrawdownPct": None,
                         "bbText": "데이터 없음",
                         "score": 0,
-                        "max": 5,
+                        "max": SCORE_MAX_INDICATORS,
                         "buyCandidate": False,
                         "sellCandidate": False,
+                        "watchCandidate": False,
+                        "candidateClass": "NONE",
                     }
                 )
                 if ccy == "KRW":
@@ -2476,6 +3853,10 @@ def run_daily_report(
             macd_sig = s.get("macdSignal")
             adx = s.get("adx14")
             high52_dd = s.get("high52wDrawdownPct")
+            vol_ratio20 = s.get("volumeRatio20")
+            ma20 = s.get("ma20")
+            ma60 = s.get("ma60")
+            atr14_pct = s.get("atr14Pct")
 
             s_rsi = rsi_signal(rsi)
             s_stoch = stoch_rsi_signal(stoch)
@@ -2483,20 +3864,55 @@ def run_daily_report(
             s_adx = adx_signal(adx)
             s_high52 = high52w_signal(high52_dd)
             bb = s.get("bollinger20", {})
-            s_bb = bollinger_signal(s.get("curPrice") or ref_price, bb.get("middle"), bb.get("upper"), bb.get("lower"))
-            score, maxv = total_score(rsi, stoch, macd, macd_sig, adx, high52_dd)
+            price_now = s.get("curPrice") or ref_price
+            bb_upper = bb.get("upper")
+            s_bb = bollinger_signal(price_now, bb.get("middle"), bb_upper, bb.get("lower"))
+            score, maxv = total_score(
+                rsi,
+                stoch,
+                macd,
+                macd_sig,
+                adx,
+                high52_dd,
+                vol_ratio20,
+                ma20,
+                ma60,
+                price_now,
+                atr14_pct,
+            )
             score_text = score_label(score, maxv)
 
-            is_buy = score >= 3 and macd is not None and macd_sig is not None and macd > macd_sig
-            is_sell = (
-                (rsi is not None and rsi >= 70)
-                or (stoch is not None and stoch > 80)
-                or (score <= 1 and macd is not None and macd_sig is not None and macd < macd_sig)
+            score_ratio = (score / maxv) if maxv else 0.0
+            is_bb_upper_near = is_bollinger_upper_touch_or_near(price_now, bb_upper)
+            is_buy, is_sell, is_watch, candidate_class = classify_candidates(
+                score_ratio,
+                rsi,
+                stoch,
+                macd,
+                macd_sig,
+                ma20,
+                ma60,
+                is_bb_upper_near,
             )
+            if is_sell:
+                is_buy = False
+                is_watch = False
             if is_buy:
                 buy_list.append(f"{name}({sym})")
             if is_sell:
                 sell_list.append(f"{name}({sym})")
+            if is_watch:
+                watch_list.append(f"{name}({sym})")
+            warn_label = f"{name}({sym})"
+            if cur_chg is not None and float(cur_chg) <= -0.05:
+                warn_drop_5.append(warn_label)
+            high60_dd = s.get("highDrawdownPct")
+            if high60_dd is not None and float(high60_dd) <= -0.25:
+                warn_high60_dd25.append(warn_label)
+            if rsi is not None and float(rsi) <= 25:
+                warn_rsi25.append(warn_label)
+            if vol_ratio20 is not None and float(vol_ratio20) >= 3.0:
+                warn_vol3x.append(warn_label)
             report_stock_rows.append(
                 {
                     "symbol": sym,
@@ -2512,12 +3928,20 @@ def run_daily_report(
                     "macd": macd,
                     "macdSignal": macd_sig,
                     "adx14": adx,
+                    "volumeRatio20": vol_ratio20,
+                    "ma20": ma20,
+                    "ma60": ma60,
+                    "ma20DiffPct": s.get("ma20DiffPct"),
+                    "ma60DiffPct": s.get("ma60DiffPct"),
+                    "atr14Pct": atr14_pct,
                     "high52wDrawdownPct": high52_dd,
                     "bbText": s_bb,
                     "score": score,
                     "max": maxv,
                     "buyCandidate": is_buy,
                     "sellCandidate": is_sell,
+                    "watchCandidate": is_watch,
+                    "candidateClass": candidate_class,
                 }
             )
 
@@ -2530,6 +3954,9 @@ def run_daily_report(
                 f"📊 Stoch RSI(14): {f'{stoch:.3f}' if stoch is not None else 'N/A'}  {s_stoch[0]} {s_stoch[1]}",
                 f"📈 MACD: {f'{macd:.4f}' if macd is not None else 'N/A'} / Signal: {f'{macd_sig:.4f}' if macd_sig is not None else 'N/A'}  {s_macd[0]} {s_macd[1]}",
                 f"✔ ADX(14): {f'{adx:.1f}' if adx is not None else 'N/A'}  {s_adx[0]} {s_adx[1]}",
+                f"📣 거래량(20일 대비): {f'{vol_ratio20:.2f}x' if vol_ratio20 is not None else 'N/A'}",
+                f"📐 MA20/MA60: {(fmt_money(ma20, ccy) if ma20 is not None else 'N/A')} / {(fmt_money(ma60, ccy) if ma60 is not None else 'N/A')}",
+                f"📉 ATR%(14): {fmt_pct_signed(atr14_pct, 2) if atr14_pct is not None else 'N/A'}",
                 f"✔ 52주 고점비: {fmt_pct_signed(high52_dd)}  {s_high52[0]} {s_high52[1]}",
                 f"🎯 Bollinger(20,2): {s_bb}",
             ]
@@ -2565,45 +3992,68 @@ def run_daily_report(
                 today,
                 market_rows_for_report,
                 report_stock_rows,
+                conn,
+                shared_candidate_brief_cache,
             )
             if candidate_brief_dirty:
                 dirty = True
             report_url = f"{web_base_url.rstrip('/')}/report/{report_token}"
+            portfolio_diag = compute_portfolio_diagnosis(report_stock_rows)
+            portfolio_diag["coachLine"] = get_or_create_portfolio_coach_line(conn, today, portfolio_diag)
             html = render_chat_report_html(
                 today,
                 now_time,
                 buy_list,
                 sell_list,
+                watch_list,
+                universe_suggestions,
                 report_stock_rows,
                 manage_url,
                 market_rows_for_report,
                 candidate_brief_json,
+                portfolio_diag,
             )
             save_chat_report(conn, chat_id, report_token, html)
 
         market_brief_url = f"{web_base_url.rstrip('/')}/report/{market_brief_token}" if (web_base_url and market_brief_token) else ""
-        buttons = []
-        if market_brief_url:
-            buttons.append({"text": "📰 마켓 브리프", "url": market_brief_url})
         economy_brief_url = f"{web_base_url.rstrip('/')}/report/{economy_brief_token}" if (web_base_url and economy_brief_token) else ""
-        if economy_brief_url:
-            buttons.append({"text": "📘 경제분석 리포트", "url": economy_brief_url})
-        if report_url:
-            buttons.append({"text": "📊 종목 현황", "url": report_url})
-        if manage_url:
-            buttons.append({"text": "⚙️ 내 종목 관리", "url": manage_url})
+        buttons = build_daily_report_buttons(
+            market_brief_url=market_brief_url,
+            economy_brief_url=economy_brief_url,
+            report_url=report_url,
+            manage_url=manage_url,
+        )
         short_msg_lines = [
             f"📮 투자 알림 ({today} {now_time})",
-            f"🟢 매수 후보: {', '.join(buy_list[:6]) if buy_list else '없음'}",
-            f"🔴 매도 후보: {', '.join(sell_list[:6]) if sell_list else '없음'}",
+            f"🟢 매수 후보(신규 분할매수 관찰/진입): {', '.join(buy_list[:6]) if buy_list else '없음'}",
+            f"🔴 매도 후보(익절/리스크 관리 고려): {', '.join(sell_list[:6]) if sell_list else '없음'}",
+            f"🟡 과열 주의(WATCH, 매도 아님): {', '.join(watch_list[:6]) if watch_list else '없음'}",
         ]
         if len(buy_list) > 6:
             short_msg_lines.append(f"… 매수 후보 추가 {len(buy_list) - 6}개")
         if len(sell_list) > 6:
             short_msg_lines.append(f"… 매도 후보 추가 {len(sell_list) - 6}개")
+        if len(watch_list) > 6:
+            short_msg_lines.append(f"… 과열 주의 추가 {len(watch_list) - 6}개")
         if has_usd:
             short_msg_lines.append(f"💱 환율: {fmt_money(usdkrw, 'KRW')}" if usdkrw else "💱 환율: 조회 실패")
-        short_msg_lines.append("자세한 내용은 아래 버튼에서 확인하세요.")
+        warning_rows: list[tuple[str, list[str]]] = [
+            ("-5% 급락", warn_drop_5),
+            ("60일 고점 대비 -25% 돌파", warn_high60_dd25),
+            ("RSI 25 이하", warn_rsi25),
+            ("거래량 3배 이상 급증", warn_vol3x),
+        ]
+        warning_rows = [(label, items) for label, items in warning_rows if items]
+        if warning_rows:
+            short_msg_lines.append("────────")
+            short_msg_lines.append("🚨 Warning 🚨")
+            for label, items in warning_rows:
+                shown = ", ".join(items[:4])
+                more = f" 외 {len(items) - 4}개" if len(items) > 4 else ""
+                short_msg_lines.append(f"• {label} : {shown}{more}")
+        short_msg_lines.append("────────")
+        short_msg_lines.append("도움이 되셨다면 작은 후원으로 운영에 힘을 보태주세요. 💖")
+        short_msg_lines.append("────────")
         short_msg = "\n".join(short_msg_lines)
         if buttons:
             tg.send_text_with_buttons(chat_id, short_msg, buttons)
@@ -2638,6 +4088,31 @@ def run_daily_report(
             naver_client_secret,
         )
 
+
+
+def run_universe_scan(conn: sqlite3.Connection):
+    now = now_kst()
+    today = fmt_date_kst(now)
+    symbol_map = load_universe_symbol_map(conn)
+    symbols = sorted({s for arr in symbol_map.values() for s in arr if s})
+    snap_map = load_latest_snapshots(conn, symbols, 60)
+    rows = score_universe_candidates(symbol_map, snap_map)
+    name_map = load_symbol_name_map(conn, symbols)
+    for _, lst in rows.items():
+        for r in lst:
+            sym = str(r.get("symbol", "")).upper()
+            if sym and sym in name_map:
+                r["name"] = name_map[sym]
+    summary = openai_universe_summary(conn, today, rows, {})
+    LOG.info(
+        "universe_scan done date=%s kospi200=%s kosdaq100=%s nasdaq_major=%s dow30=%s",
+        today,
+        len(rows.get("KOSPI200", [])),
+        len(rows.get("KOSDAQ100", [])),
+        len(rows.get("NASDAQ_MAJOR", [])),
+        len(rows.get("DOW30", [])),
+    )
+    LOG.info("universe_scan summary_keys=%s", ",".join(sorted(summary.keys())))
 
 
 def run_morning_card(conn: sqlite3.Connection, tg: TelegramClient, chat_ids: list[str]):
@@ -2806,18 +4281,19 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_chat_configs(Path(args.symbols_file))
-    chat_ids = load_chat_ids(args, cfg)
-    if not chat_ids:
-        raise RuntimeError("No chat ids found. Set --telegram-chat-ids-json or add chat ids in chat-configs.js")
-
+    chat_ids: list[str] = []
     token = args.telegram_token or ""
-    if not token:
-        raise RuntimeError("--telegram-token (or env wrapper) is required")
+    if args.task != "universe_scan":
+        chat_ids = load_chat_ids(args, cfg)
+        if not chat_ids:
+            raise RuntimeError("No chat ids found. Set --telegram-chat-ids-json or add chat ids in chat-configs.js")
+        if not token:
+            raise RuntimeError("--telegram-token (or env wrapper) is required")
 
     conn = sqlite3.connect(args.db_path)
     try:
         ensure_alert_schema(conn)
-        tg = TelegramClient(token)
+        tg = TelegramClient(token) if token else None
         runtime = default_runtime_config()
         web_base = (args.web_base_url or "").strip().rstrip("/")
         manage_url = (args.manage_page_url or "").strip()
@@ -2827,7 +4303,7 @@ def main():
         if args.task == "daily_report":
             run_daily_report(
                 conn,
-                tg,
+                tg if tg is not None else TelegramClient(token),
                 cfg,
                 chat_ids,
                 runtime,
@@ -2838,9 +4314,11 @@ def main():
                 prepare_economy_only=bool(args.prepare_economy_only),
             )
         elif args.task == "morning_card":
-            run_morning_card(conn, tg, chat_ids)
+            run_morning_card(conn, tg if tg is not None else TelegramClient(token), chat_ids)
         elif args.task == "envelope_watch":
-            run_envelope_watch(conn, tg, chat_ids, max(2, int(args.envelope_period)), float(args.envelope_pct), cfg)
+            run_envelope_watch(conn, tg if tg is not None else TelegramClient(token), chat_ids, max(2, int(args.envelope_period)), float(args.envelope_pct), cfg)
+        elif args.task == "universe_scan":
+            run_universe_scan(conn)
     finally:
         conn.close()
 
